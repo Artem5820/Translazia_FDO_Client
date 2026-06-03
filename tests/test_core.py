@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from translazia_client.analysis import AnalysisSummary, combine_analysis_summaries, summarize_audio_payload
 from translazia_client.layout import ScreenRect, compute_window_placements
-from translazia_client.controllers.main_controller import _screens_with_notification_strip
+from translazia_client.controllers.main_controller import _recording_time_is_valid, _recording_title, _screens_with_notification_strip
 from translazia_client.resources import APP_ICON_PATH, LOGO_PATH
 from translazia_client.config import SourceSettings
 from translazia_client.services.results_cleanup import cleanup_results_folder
@@ -44,6 +44,14 @@ https://vk.com/call/join/abc
     def test_notification_strip_width_is_240(self) -> None:
         _, notification = _screens_with_notification_strip()
         self.assertEqual(notification.width, 240)
+
+    def test_recording_title_uses_room_and_current_date_format(self) -> None:
+        self.assertEqual(_recording_title("В-505", "03_06_2026"), "В505 03_06_2026")
+
+    def test_recording_time_must_be_in_future_today(self) -> None:
+        now = datetime(2026, 6, 3, 17, 55, 1)
+        self.assertFalse(_recording_time_is_valid(17, 55, now))
+        self.assertTrue(_recording_time_is_valid(17, 56, now))
 
     def test_seed_file_has_twelve_rooms(self) -> None:
         streams = load_streams_from_file("data/streams_seed.txt")

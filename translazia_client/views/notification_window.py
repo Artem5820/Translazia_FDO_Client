@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QPushButton,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -28,8 +29,23 @@ from ..services.analysis_messages import analysis_problem_category, compact_anal
 from ..services.client_logger import log_event
 
 
+class TwoDigitSpinBox(QSpinBox):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setKeyboardTracking(False)
+        self.lineEdit().setReadOnly(True)
+        self.lineEdit().setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.lineEdit().setCursor(Qt.CursorShape.ArrowCursor)
+
+    def textFromValue(self, value: int) -> str:
+        return f"{value:02d}"
+
+
 class NotificationWindow(QMainWindow):
     mute_all_requested = Signal(bool)
+    close_streams_requested = Signal()
+    record_all_requested = Signal()
+    auto_recording_changed = Signal(bool, int, int)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -38,6 +54,10 @@ class NotificationWindow(QMainWindow):
         self.neural_events = 0
         self.compact_mode = False
         self._all_audio_muted = False
+        self._auto_recording_enabled = False
+        self._record_hour = 17
+        self._record_minute = 55
+        self._syncing_record_controls = False
         self.compact_lines: list[str] = []
         self.setWindowTitle("Уведомления и ошибки")
         self.setWindowIcon(app_icon())
@@ -74,6 +94,11 @@ class NotificationWindow(QMainWindow):
         self.header_mute_btn.setToolTip("Отключить или включить звук во всех окнах трансляций")
         self.header_mute_btn.clicked.connect(self._toggle_all_audio_mute)
         header.addWidget(self.header_mute_btn)
+        self.header_close_streams_btn = QPushButton("Закрыть трансляции")
+        self.header_close_streams_btn.setObjectName("dangerButton")
+        self.header_close_streams_btn.setToolTip("Быстро закрыть все открытые окна трансляций")
+        self.header_close_streams_btn.clicked.connect(self.close_streams_requested.emit)
+        header.addWidget(self.header_close_streams_btn)
         export_btn = QPushButton("Экспорт")
         export_btn.clicked.connect(self.export_dialog)
         clear_btn = QPushButton("Очистить")
@@ -85,6 +110,8 @@ class NotificationWindow(QMainWindow):
         self.badge = QLabel("Событий пока нет")
         self.badge.setObjectName("notificationBadge")
         layout.addWidget(self.badge)
+        self.record_controls_frame = self._record_controls(compact=False)
+        layout.addWidget(self.record_controls_frame)
 
         self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(["Время", "Уровень", "Аудитория", "Сообщение"])
@@ -116,16 +143,25 @@ class NotificationWindow(QMainWindow):
         self.compact_total = QLabel("0")
         self.compact_total.setObjectName("stripTotal")
         self.compact_total.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        total_metric = self._compact_metric(self.compact_total, "События")
         self.compact_errors = QLabel("0")
         self.compact_errors.setObjectName("stripErrors")
         self.compact_errors.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        errors_metric = self._compact_metric(self.compact_errors, "Ошибки")
         self.compact_neural = QLabel("0")
         self.compact_neural.setObjectName("stripNeural")
         self.compact_neural.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        neural_metric = self._compact_metric(self.compact_neural, "Нейросеть")
         self.compact_mute_btn = QPushButton("Откл. звук")
         self.compact_mute_btn.setToolTip("Отключить или включить звук во всех окнах")
         self.compact_mute_btn.setFixedHeight(30)
         self.compact_mute_btn.clicked.connect(self._toggle_all_audio_mute)
+        self.compact_close_streams_btn = QPushButton("Закрыть")
+        self.compact_close_streams_btn.setObjectName("stripCloseStreamsButton")
+        self.compact_close_streams_btn.setToolTip("Закрыть все трансляции")
+        self.compact_close_streams_btn.setFixedHeight(30)
+        self.compact_close_streams_btn.clicked.connect(self.close_streams_requested.emit)
+        self.compact_record_controls_frame = self._record_controls(compact=True)
         self.compact_log = QTextEdit()
         self.compact_log.setObjectName("stripLog")
         self.compact_log.setReadOnly(True)
@@ -133,16 +169,167 @@ class NotificationWindow(QMainWindow):
         self.compact_log.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.compact_log.setPlaceholderText("События и ошибки")
         compact_layout.addWidget(compact_logo)
-        compact_layout.addWidget(self.compact_total)
-        compact_layout.addWidget(self.compact_errors)
-        compact_layout.addWidget(self.compact_neural)
+        compact_layout.addWidget(total_metric)
+        compact_layout.addWidget(errors_metric)
+        compact_layout.addWidget(neural_metric)
         compact_layout.addWidget(self.compact_mute_btn)
+        compact_layout.addWidget(self.compact_close_streams_btn)
+        compact_layout.addWidget(self.compact_record_controls_frame)
         compact_layout.addWidget(self.compact_log, 1)
         self.compact_panel.hide()
         layout.addWidget(self.compact_panel, 1)
         self.setCentralWidget(root)
+        self._sync_record_controls()
         self._update_compact_counts()
         self.set_all_audio_muted(False)
+
+    def _record_controls(self, compact: bool) -> QFrame:
+        frame = QFrame()
+        frame.setObjectName("stripRecordControlBar" if compact else "recordControlBar")
+        root = QVBoxLayout(frame)
+        root.setContentsMargins(4 if compact else 8, 6, 4 if compact else 8, 6)
+        root.setSpacing(5 if compact else 6)
+
+        button_row = QHBoxLayout()
+        button_row.setContentsMargins(0, 0, 0, 0)
+        button_row.setSpacing(6)
+
+        record_btn = QPushButton("Запись")
+        record_btn.setObjectName("recordManualButton")
+        record_btn.setToolTip("Поставить запись вручную на всех открытых вкладках")
+        record_btn.clicked.connect(self.record_all_requested.emit)
+        record_btn.setFixedWidth(84 if compact else 116)
+
+        hour_spin = TwoDigitSpinBox()
+        hour_spin.setObjectName("recordTimeSpin")
+        hour_spin.setRange(0, 23)
+        hour_spin.setFixedWidth(94 if compact else 92)
+        hour_spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hour_spin.setWrapping(True)
+
+        colon = QLabel(":")
+        colon.setObjectName("recordTimeColon")
+        colon.setFixedWidth(14)
+        colon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        minute_spin = TwoDigitSpinBox()
+        minute_spin.setObjectName("recordTimeSpin")
+        minute_spin.setRange(0, 59)
+        minute_spin.setFixedWidth(94 if compact else 92)
+        minute_spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        minute_spin.setWrapping(True)
+
+        auto_btn = QPushButton("Авто")
+        auto_btn.setObjectName("recordAutoButton")
+        auto_btn.setCheckable(True)
+        auto_btn.setToolTip("Автоматически поставить запись в указанное время")
+        auto_btn.toggled.connect(lambda checked: self._set_auto_recording_enabled(checked, emit_signal=True))
+        auto_btn.setFixedWidth(72 if compact else 94)
+
+        confirm_btn = QPushButton("OK")
+        confirm_btn.setObjectName("recordConfirmButton")
+        confirm_btn.setToolTip("Подтвердить автозапись на сегодня")
+        confirm_btn.setFixedWidth(48 if compact else 62)
+        confirm_btn.clicked.connect(self._confirm_auto_recording)
+
+        hour_spin.valueChanged.connect(lambda value: self._set_record_time(value, minute_spin.value()))
+        minute_spin.valueChanged.connect(lambda value: self._set_record_time(hour_spin.value(), value))
+
+        time_row_frame = QWidget()
+        time_row_frame.setObjectName("recordTimeRow")
+        time_row = QHBoxLayout(time_row_frame)
+        time_row.setContentsMargins(0, 0, 0, 0)
+        time_row.setSpacing(6)
+        time_row.addWidget(hour_spin)
+        time_row.addWidget(colon)
+        time_row.addWidget(minute_spin)
+
+        button_row.addWidget(record_btn)
+        button_row.addWidget(auto_btn)
+        button_row.addWidget(confirm_btn)
+        root.addLayout(button_row)
+        root.addWidget(time_row_frame)
+
+        if compact:
+            self.compact_record_btn = record_btn
+            self.compact_record_hour_spin = hour_spin
+            self.compact_record_colon = colon
+            self.compact_record_minute_spin = minute_spin
+            self.compact_record_time_row = time_row_frame
+            self.compact_auto_record_btn = auto_btn
+            self.compact_record_confirm_btn = confirm_btn
+        else:
+            self.header_record_btn = record_btn
+            self.header_record_hour_spin = hour_spin
+            self.header_record_colon = colon
+            self.header_record_minute_spin = minute_spin
+            self.header_record_time_row = time_row_frame
+            self.header_auto_record_btn = auto_btn
+            self.header_record_confirm_btn = confirm_btn
+        return frame
+
+    def _compact_metric(self, value_label: QLabel, caption: str) -> QFrame:
+        card = QFrame()
+        card.setObjectName("stripMetricCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(4, 5, 4, 5)
+        layout.setSpacing(0)
+        caption_label = QLabel(caption)
+        caption_label.setObjectName("stripMetricCaption")
+        caption_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(value_label)
+        layout.addWidget(caption_label)
+        return card
+
+    def _record_time_widgets(self) -> list[QWidget]:
+        widgets: list[QWidget] = []
+        for prefix in ("header", "compact"):
+            for name in ("record_time_row", "record_hour_spin", "record_colon", "record_minute_spin", "record_confirm_btn"):
+                widget = getattr(self, f"{prefix}_{name}", None)
+                if widget is not None:
+                    widgets.append(widget)
+        return widgets
+
+    def _sync_record_controls(self) -> None:
+        if self._syncing_record_controls:
+            return
+        self._syncing_record_controls = True
+        try:
+            for prefix in ("header", "compact"):
+                hour_spin = getattr(self, f"{prefix}_record_hour_spin", None)
+                minute_spin = getattr(self, f"{prefix}_record_minute_spin", None)
+                auto_btn = getattr(self, f"{prefix}_auto_record_btn", None)
+                if hour_spin is not None:
+                    hour_spin.setValue(self._record_hour)
+                if minute_spin is not None:
+                    minute_spin.setValue(self._record_minute)
+                if auto_btn is not None:
+                    auto_btn.setChecked(self._auto_recording_enabled)
+            for widget in self._record_time_widgets():
+                widget.setVisible(self._auto_recording_enabled)
+        finally:
+            self._syncing_record_controls = False
+
+    def _set_record_time(self, hour: int, minute: int) -> None:
+        if self._syncing_record_controls:
+            return
+        self._record_hour = int(hour)
+        self._record_minute = int(minute)
+        self._sync_record_controls()
+
+    def _set_auto_recording_enabled(self, enabled: bool, emit_signal: bool = False) -> None:
+        if self._syncing_record_controls:
+            return
+        self._auto_recording_enabled = bool(enabled)
+        self._sync_record_controls()
+        if emit_signal and not self._auto_recording_enabled:
+            self.auto_recording_changed.emit(False, self._record_hour, self._record_minute)
+
+    @Slot()
+    def _confirm_auto_recording(self) -> None:
+        if not self._auto_recording_enabled:
+            return
+        self.auto_recording_changed.emit(True, self._record_hour, self._record_minute)
 
     def clear(self) -> None:
         self.table.setRowCount(0)
@@ -193,6 +380,7 @@ class NotificationWindow(QMainWindow):
         self.compact_mode = compact
         self.header_frame.setVisible(not compact)
         self.badge.setVisible(not compact)
+        self.record_controls_frame.setVisible(not compact)
         self.table.setVisible(not compact)
         self.details.setVisible(not compact)
         self.compact_panel.setVisible(compact)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Callable
+import json
 import time
 
 from PySide6.QtCore import QEvent, Qt, QTimer, QUrl, Signal, Slot
@@ -97,8 +98,14 @@ class StreamWindow(QMainWindow):
             """
         )
         self._update_mute_button()
+        self.refresh_button = QPushButton("⟳", self)
+        self.refresh_button.setObjectName("streamRefreshButton")
+        self.refresh_button.setFixedSize(34, 34)
+        self.refresh_button.setToolTip("Обновить вкладку и повторить подключение")
+        self.refresh_button.clicked.connect(self.manual_reload_and_retry_join)
         self.room_badge.raise_()
         self.mute_button.raise_()
+        self.refresh_button.raise_()
         self.prev_button = QPushButton("‹", self)
         self.prev_button.setObjectName("streamNavButton")
         self.prev_button.setFixedSize(42, 72)
@@ -152,6 +159,19 @@ class StreamWindow(QMainWindow):
                 background: #ffffff;
                 border-color: #006dff;
             }
+            QPushButton#streamRefreshButton {
+                background: rgba(255, 255, 255, 232);
+                color: #00328a;
+                border: 1px solid rgba(0, 76, 190, 170);
+                border-radius: 8px;
+                font-size: 18px;
+                font-weight: 900;
+                padding: 0;
+            }
+            QPushButton#streamRefreshButton:hover {
+                background: #ffffff;
+                border-color: #006dff;
+            }
             QPushButton#streamCloseButton {
                 background: rgba(255, 255, 255, 232);
                 color: #9a1b1b;
@@ -183,6 +203,7 @@ class StreamWindow(QMainWindow):
             button.setVisible(visible)
             if visible:
                 button.raise_()
+        self.refresh_button.raise_()
         QTimer.singleShot(0, self._position_overlay_buttons)
 
     def set_focus_mode_active(self, active: bool) -> None:
@@ -243,14 +264,26 @@ class StreamWindow(QMainWindow):
         self._join_clicked = False
         self._schedule_join_attempts()
 
-    def reload_and_retry_join(self) -> None:
-        if self._closing or self._in_call:
+    @Slot()
+    def manual_reload_and_retry_join(self) -> None:
+        if self._closing:
             return
+        self.launch_state_changed.emit(self.stream.room, "manual_reloaded")
+        self.reload_and_retry_join(force=True)
+
+    def reload_and_retry_join(self, force: bool = False) -> None:
+        if self._closing or (self._in_call and not force):
+            return
+        self._in_call = False
         self._join_clicked = False
         self._join_clicked_at = 0.0
         self._page_loaded = False
         try:
-            self.view.setUrl(QUrl(self.stream.url))
+            target_url = QUrl(self.stream.url)
+            if self.view.url() == target_url:
+                self.view.reload()
+            else:
+                self.view.setUrl(target_url)
         except RuntimeError:
             self._closing = True
 
@@ -399,6 +432,27 @@ class StreamWindow(QMainWindow):
             return "loaded"
         return "loading"
 
+    def ensure_call_recording(self, title: str, callback: Callable[[dict[str, object]], None]) -> None:
+        if self._closing:
+            callback({"state": "closed", "recording": False})
+            return
+        script = _START_RECORDING_SCRIPT.replace("__RECORDING_TITLE__", json.dumps(title, ensure_ascii=False))
+        try:
+            self.view.page().runJavaScript(script, lambda result: callback(_recording_result(result)))
+        except RuntimeError:
+            self._closing = True
+            callback({"state": "closed", "recording": False})
+
+    def inspect_recording_state(self, callback: Callable[[dict[str, object]], None]) -> None:
+        if self._closing:
+            callback({"state": "closed", "recording": False})
+            return
+        try:
+            self.view.page().runJavaScript(_INSPECT_RECORDING_SCRIPT, lambda result: callback(_recording_result(result)))
+        except RuntimeError:
+            self._closing = True
+            callback({"state": "closed", "recording": False})
+
     @Slot(QUrl, QWebEnginePage.Feature)
     def _grant_feature_permission(self, origin: QUrl, feature: QWebEnginePage.Feature) -> None:
         self.view.page().setFeaturePermission(
@@ -471,8 +525,12 @@ class StreamWindow(QMainWindow):
         close_visible = getattr(self, "close_stream_button", None) is not None and self.close_stream_button.isVisible()
         if close_visible:
             self.close_stream_button.move(max(margin, width - self.close_stream_button.width() - margin), margin)
+            self.refresh_button.move(
+                max(margin, self.close_stream_button.x() - self.refresh_button.width() - margin),
+                margin,
+            )
             self.multiwindow_button.move(
-                max(margin, self.close_stream_button.x() - self.multiwindow_button.width() - margin),
+                max(margin, self.refresh_button.x() - self.multiwindow_button.width() - margin),
                 margin,
             )
             mute_x = self.multiwindow_button.x() - self.mute_button.width() - margin
@@ -484,13 +542,17 @@ class StreamWindow(QMainWindow):
             self.prev_button.raise_()
             self.next_button.raise_()
             self.multiwindow_button.raise_()
+            self.refresh_button.raise_()
             self.close_stream_button.raise_()
         else:
-            self.mute_button.move(max(margin, width - self.mute_button.width() - margin), margin)
+            self.refresh_button.move(max(margin, width - self.refresh_button.width() - margin), margin)
+            mute_x = self.refresh_button.x() - self.mute_button.width() - margin
+            self.mute_button.move(max(margin, mute_x), margin)
             room_x = self.mute_button.x() - self.room_badge.width() - margin
             self.room_badge.move(max(margin, room_x), margin)
         self.room_badge.raise_()
         self.mute_button.raise_()
+        self.refresh_button.raise_()
 
     def changeEvent(self, event: QEvent) -> None:
         super().changeEvent(event)
@@ -543,3 +605,229 @@ class StreamWindow(QMainWindow):
         if emit_closed and not self._closed_emitted:
             self._closed_emitted = True
             self.closed.emit(self.stream.room)
+
+
+def _recording_result(result: object) -> dict[str, object]:
+    if isinstance(result, dict):
+        return result
+    return {"state": "command_started", "recording": False}
+
+
+_INSPECT_RECORDING_SCRIPT = """
+(() => {
+  const norm = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+  const text = norm(document.body ? document.body.innerText : '');
+  const recording =
+    /Ид[её]т запись звонка/i.test(text) ||
+    /\\b\\d{2}:\\d{2}\\s+Завершить\\b/i.test(text) ||
+    /запись звонка[^\\n]{0,100}Завершить/i.test(text);
+  return {state: recording ? 'recording' : 'not_recording', recording, marker: text.slice(0, 300)};
+})()
+"""
+
+
+_START_RECORDING_SCRIPT = """
+(async () => {
+  const title = __RECORDING_TITLE__;
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const norm = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+  const visible = (node) => {
+    if (!node || !node.getBoundingClientRect) return false;
+    const rect = node.getBoundingClientRect();
+    const style = getComputedStyle(node);
+    return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+  };
+  const label = (node) => norm(
+    node.innerText ||
+    node.textContent ||
+    node.getAttribute('aria-label') ||
+    node.getAttribute('title') ||
+    node.getAttribute('data-testid') ||
+    ''
+  );
+  const actionSelector = 'button, [role="button"], a, .vkuiButton, .Button, [tabindex]';
+  const textSelector = `${actionSelector}, div, span`;
+  const actionNode = (node) => node.closest(actionSelector) || node;
+  const clickables = () => Array.from(document.querySelectorAll(actionSelector)).filter(visible);
+  const textNodes = () => Array.from(document.querySelectorAll(textSelector)).filter(visible);
+  const clickNode = (node) => {
+    node = actionNode(node);
+    node.scrollIntoView({block: 'center', inline: 'center'});
+    const rect = node.getBoundingClientRect();
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+    if (window.PointerEvent) {
+      for (const type of ['pointerdown', 'pointerup']) {
+        node.dispatchEvent(new PointerEvent(type, {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, pointerType: 'mouse'}));
+      }
+    }
+    for (const type of ['mousedown', 'mouseup', 'click']) {
+      node.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y}));
+    }
+    if (typeof node.click === 'function') node.click();
+  };
+  const pageText = () => norm(document.body ? document.body.innerText : '');
+  const isRecording = () => {
+    const text = pageText();
+    return (
+      /Ид[её]т запись звонка/i.test(text) ||
+      /\\b\\d{2}:\\d{2}\\s+Завершить\\b/i.test(text) ||
+      /запись звонка[^\\n]{0,100}Завершить/i.test(text)
+    );
+  };
+  const findByText = (patterns) => {
+    const candidates = textNodes()
+      .map((node) => actionNode(node))
+      .filter((node, index, nodes) => node && visible(node) && nodes.indexOf(node) === index);
+    for (const node of candidates) {
+      const text = label(node);
+      if (!text || text.length > 160) continue;
+      if (patterns.some((pattern) => pattern.test(text))) return node;
+    }
+    return null;
+  };
+  const closeTransientUi = async () => {
+    document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true}));
+    document.dispatchEvent(new KeyboardEvent('keyup', {key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true}));
+    await sleep(250);
+  };
+  const findGear = () => {
+    const named = findByText([/настрой/i, /параметр/i, /settings/i]);
+    if (named) return named;
+    const width = Math.max(1, window.innerWidth || document.documentElement.clientWidth || 1);
+    const height = Math.max(1, window.innerHeight || document.documentElement.clientHeight || 1);
+    const rightBottomIcons = clickables()
+      .map((node) => actionNode(node))
+      .filter((node, index, nodes) => node && nodes.indexOf(node) === index)
+      .filter((node) => {
+        const rect = node.getBoundingClientRect();
+        const text = label(node);
+        if (/заверш|микрофон|камера|демонстрац|поднять руку|чат|ссылка/i.test(text)) return false;
+        return (
+          node.querySelector('svg') &&
+          rect.left > width * 0.62 &&
+          rect.top > height * 0.68 &&
+          rect.width >= 24 &&
+          rect.width <= 90 &&
+          rect.height >= 24 &&
+          rect.height <= 90
+        );
+      })
+      .sort((a, b) => {
+        const ar = a.getBoundingClientRect();
+        const br = b.getBoundingClientRect();
+        return ar.left - br.left;
+      });
+    if (rightBottomIcons.length >= 2) return rightBottomIcons[1];
+    return rightBottomIcons[0] || null;
+  };
+  const findGearCandidates = () => {
+    const named = findByText([/настрой/i, /параметр/i, /settings/i]);
+    const candidates = named ? [named] : [];
+    const width = Math.max(1, window.innerWidth || document.documentElement.clientWidth || 1);
+    const height = Math.max(1, window.innerHeight || document.documentElement.clientHeight || 1);
+    const rightBottom = [];
+    for (const node of clickables()) {
+      const rect = node.getBoundingClientRect();
+      const text = label(node);
+      if (/заверш|микрофон|камера|демонстрац|поднять руку|чат|ссылка/i.test(text)) continue;
+      if (
+        node.querySelector('svg') &&
+        rect.left > width * 0.62 &&
+        rect.top > height * 0.68 &&
+        rect.width >= 24 &&
+        rect.width <= 90 &&
+        rect.height >= 24 &&
+        rect.height <= 90
+      ) {
+        rightBottom.push(actionNode(node));
+      }
+    }
+    rightBottom.sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
+    if (rightBottom.length >= 2) candidates.push(rightBottom[1]);
+    for (const node of rightBottom) candidates.push(node);
+    return candidates.filter((node, index, nodes) => node && nodes.indexOf(node) === index);
+  };
+  const findTitleField = () => {
+    const fields = Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"]')).filter(visible);
+    if (!fields.length) return null;
+    return fields.find((field) => /групповой звонок|название|звонок|call|record/i.test(norm(
+      field.value ||
+      field.innerText ||
+      field.textContent ||
+      field.getAttribute('placeholder') ||
+      field.getAttribute('aria-label') ||
+      ''
+    ))) || fields[fields.length - 1];
+  };
+  const setFieldValue = (field, value) => {
+    field.focus();
+    if ('value' in field) {
+      const setter =
+        Object.getOwnPropertyDescriptor(field.constructor.prototype, 'value')?.set ||
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set ||
+        Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+      if (setter) {
+        setter.call(field, value);
+      } else {
+        field.value = value;
+      }
+      field.dispatchEvent(new Event('input', {bubbles: true}));
+      field.dispatchEvent(new Event('change', {bubbles: true}));
+      return;
+    }
+    field.textContent = '';
+    field.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'deleteContent'}));
+    field.textContent = value;
+    field.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: value}));
+  };
+
+  if (isRecording()) {
+    return {state: 'already_recording', recording: true, title};
+  }
+
+  let recordAction = findByText([/^Записать звонок$/i, /Записать звонок/i]);
+  if (!recordAction || /Создать запись звонка/i.test(pageText())) {
+    recordAction = null;
+  }
+  if (!recordAction && !/Создать запись звонка|Название/i.test(pageText())) {
+    const gears = findGearCandidates();
+    if (!gears.length) {
+      const gear = findGear();
+      if (gear) gears.push(gear);
+    }
+    if (!gears.length) return {state: 'gear_not_found', recording: false, title};
+    for (const gear of gears) {
+      clickNode(gear);
+      await sleep(900);
+      recordAction = findByText([/^Записать звонок$/i, /Записать звонок/i]);
+      if (recordAction) break;
+      await closeTransientUi();
+    }
+  }
+  if (recordAction) {
+    clickNode(recordAction);
+    await sleep(900);
+  }
+  if (!/Создать запись звонка|Название/i.test(pageText())) {
+    await sleep(700);
+  }
+  if (!/Создать запись звонка|Название/i.test(pageText()) && !recordAction) {
+    return {state: 'record_action_not_found', recording: false, title};
+  }
+  if (!/Создать запись звонка|Название/i.test(pageText())) {
+    return {state: 'record_dialog_not_opened', recording: false, title};
+  }
+
+  const field = findTitleField();
+  if (!field) return {state: 'title_field_not_found', recording: false, title};
+  setFieldValue(field, title);
+  await sleep(250);
+
+  const submit = findByText([/^Записать звонок$/i, /^Создать запись/i]);
+  if (!submit) return {state: 'submit_not_found', recording: false, title};
+  clickNode(submit);
+  await sleep(900);
+  return {state: 'record_requested', recording: isRecording(), title};
+})()
+"""

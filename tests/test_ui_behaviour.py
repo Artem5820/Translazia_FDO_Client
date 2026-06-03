@@ -34,6 +34,13 @@ class UiBehaviourTests(unittest.TestCase):
         self.assertEqual(window.selected_count_label.text(), "Выбрано: 1 из 2")
         window.close()
 
+    def test_main_window_has_no_close_streams_button(self) -> None:
+        _app()
+        window = MainWindow()
+
+        self.assertFalse(hasattr(window, "close_btn"))
+        window.close()
+
     def test_notification_export_writes_events(self) -> None:
         _app()
         window = NotificationWindow()
@@ -58,4 +65,66 @@ class UiBehaviourTests(unittest.TestCase):
         self.assertEqual(states, [True])
         self.assertEqual(window.compact_mute_btn.text(), "Вкл. звук")
         self.assertEqual(window.header_mute_btn.text(), "Вкл. звук")
+        window.close()
+
+    def test_notification_compact_metrics_have_captions(self) -> None:
+        _app()
+        window = NotificationWindow()
+        captions = {label.text() for label in window.compact_panel.findChildren(type(window.compact_total))}
+
+        self.assertIn("События", captions)
+        self.assertIn("Ошибки", captions)
+        self.assertIn("Нейросеть", captions)
+        window.close()
+
+    def test_notification_record_controls_toggle_time_inputs(self) -> None:
+        _app()
+        window = NotificationWindow()
+
+        self.assertEqual(window.header_record_hour_spin.value(), 17)
+        self.assertEqual(window.header_record_minute_spin.value(), 55)
+        self.assertTrue(window.header_record_time_row.isHidden())
+        self.assertTrue(window.header_record_hour_spin.isHidden())
+        self.assertTrue(window.header_record_minute_spin.isHidden())
+
+        window.header_auto_record_btn.click()
+
+        self.assertFalse(window.header_record_time_row.isHidden())
+        self.assertFalse(window.header_record_confirm_btn.isHidden())
+        self.assertFalse(window.header_record_hour_spin.isHidden())
+        self.assertFalse(window.header_record_minute_spin.isHidden())
+        self.assertFalse(window.compact_record_time_row.isHidden())
+        self.assertTrue(window.compact_auto_record_btn.isChecked())
+        window.close()
+
+    def test_notification_record_controls_emit_signals(self) -> None:
+        _app()
+        window = NotificationWindow()
+        manual_requests: list[str] = []
+        auto_requests: list[tuple[bool, int, int]] = []
+        window.record_all_requested.connect(lambda: manual_requests.append("record"))
+        window.auto_recording_changed.connect(lambda enabled, hour, minute: auto_requests.append((enabled, hour, minute)))
+
+        window.header_record_btn.click()
+        window.compact_record_btn.click()
+        window.header_auto_record_btn.click()
+        window.header_record_hour_spin.setValue(18)
+        self.assertEqual(auto_requests, [])
+        window.header_record_confirm_btn.click()
+        window.header_auto_record_btn.click()
+
+        self.assertEqual(manual_requests, ["record", "record"])
+        self.assertEqual(auto_requests, [(True, 18, 55), (False, 18, 55)])
+        window.close()
+
+    def test_notification_close_streams_buttons_emit_signal(self) -> None:
+        _app()
+        window = NotificationWindow()
+        requests: list[str] = []
+        window.close_streams_requested.connect(lambda: requests.append("close"))
+
+        window.header_close_streams_btn.click()
+        window.compact_close_streams_btn.click()
+
+        self.assertEqual(requests, ["close", "close"])
         window.close()

@@ -197,17 +197,66 @@ QTabBar::tab:selected {
     padding: 8px 10px;
     font-weight: 700;
 }
+#recordControlBar {
+    background: #ffffff;
+    border: 1px solid #d3def2;
+    border-radius: 8px;
+}
+#stripRecordControlBar {
+    background: rgba(255, 255, 255, 0.12);
+    border: 1px solid rgba(255, 255, 255, 0.24);
+    border-radius: 8px;
+}
+#recordManualButton, #recordAutoButton, #recordConfirmButton {
+    padding: 6px 6px;
+    font-weight: 800;
+}
+#stripRecordControlBar #recordManualButton,
+#stripRecordControlBar #recordAutoButton,
+#stripRecordControlBar #recordConfirmButton {
+    padding: 6px 4px;
+}
+#recordAutoButton:checked, #recordConfirmButton {
+    background: #ffffff;
+    border-color: #ffffff;
+    color: #0635b8;
+}
+#recordTimeSpin {
+    background: #ffffff;
+    border: 1px solid #9abcf2;
+    border-radius: 7px;
+    color: #0635b8;
+    font-weight: 900;
+    padding: 4px 2px;
+}
+#recordTimeColon {
+    color: #ffffff;
+    font-size: 15px;
+    font-weight: 900;
+}
+#recordControlBar #recordTimeColon {
+    color: #0635b8;
+}
 #notificationStrip {
     background: #0635b8;
     border: 0;
 }
-#stripTotal, #stripErrors, #stripNeural {
+#stripMetricCard {
     background: #ffffff;
+    border: 1px solid #9abcf2;
     border-radius: 8px;
+}
+#stripTotal, #stripErrors, #stripNeural {
     color: #0635b8;
-    font-size: 14px;
+    font-size: 16px;
     font-weight: 900;
-    padding: 6px 0;
+    padding: 0;
+}
+#stripMetricCaption {
+    color: #5a729c;
+    font-size: 10px;
+    font-weight: 800;
+    padding: 0;
 }
 #stripErrors {
     color: #9a2d2a;
@@ -222,6 +271,18 @@ QTabBar::tab:selected {
     color: #102033;
     font-size: 12px;
     padding: 6px;
+}
+#stripCloseStreamsButton {
+    background: #9a2d2a;
+    border-color: #9a2d2a;
+    color: #ffffff;
+    font-weight: 800;
+    padding: 6px 4px;
+}
+#stripCloseStreamsButton:hover {
+    background: #b23a36;
+    border-color: #b23a36;
+    color: #ffffff;
 }
 QStatusBar {
     background: #f3f7ff;

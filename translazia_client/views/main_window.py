@@ -35,7 +35,6 @@ from ..resources import LOGO_SMALL_PATH, app_icon
 class MainWindow(QMainWindow):
     refresh_requested = Signal()
     launch_requested = Signal()
-    close_streams_requested = Signal()
     settings_requested = Signal()
     notifications_requested = Signal()
     vk_login_requested = Signal()
@@ -89,15 +88,12 @@ class MainWindow(QMainWindow):
         self.notifications_btn.clicked.connect(self.notifications_requested.emit)
         self.vk_login_btn = QPushButton("VK вход")
         self.vk_login_btn.clicked.connect(self.vk_login_requested.emit)
-        self.close_btn = QPushButton("Закрыть трансляции")
-        self.close_btn.clicked.connect(self.close_streams_requested.emit)
         self.settings_btn = QPushButton("Настройки")
         self.settings_btn.clicked.connect(self.settings_requested.emit)
         header.addWidget(self.launch_btn)
         header.addWidget(self.refresh_btn)
         header.addWidget(self.notifications_btn)
         header.addWidget(self.vk_login_btn)
-        header.addWidget(self.close_btn)
         header.addWidget(self.settings_btn)
         root.addWidget(header_frame)
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 import json
 import threading
@@ -11,7 +11,7 @@ from PySide6.QtWidgets import QApplication, QDialog
 
 from ..analysis import AnalysisManager, AnalysisSummary
 from ..config import DATA_DIR, AppSettings, load_settings, save_settings
-from ..layout import ScreenRect, compute_window_placements
+from ..layout import ScreenRect, WindowPlacement, compute_window_placements
 from ..models import StreamRoom
 from ..services.healthcheck import run_startup_healthcheck
 from ..services.analysis_messages import short_analysis_message, short_problem
@@ -26,6 +26,13 @@ from ..views.settings_dialog import SettingsDialog
 from ..views.stream_window import StreamWindow
 from ..views.vk_auth_window import VkAuthWindow
 from .bridge import AppBridge
+
+
+_WINDOW_TRANSITION_BATCH_SIZE = 3
+_WINDOW_TRANSITION_BATCH_INTERVAL_MS = 20
+_RECORDING_VERIFY_DELAY_MS = 30_000
+_RECORDING_VERIFY_CALLBACK_WAIT_MS = 4_000
+_MAX_RECORDING_ATTEMPTS = 3
 
 
 class MainController(QObject):
@@ -45,6 +52,15 @@ class MainController(QObject):
         self._all_stream_audio_muted = False
         self._focused_stream_room: str | None = None
         self._focus_geometry_change = False
+        self._focus_transition_id = 0
+        self._auto_recording_enabled = False
+        self._auto_recording_hour = 17
+        self._auto_recording_minute = 55
+        self._last_auto_recording_date = ""
+        self._recording_generation = 0
+        self._recording_attempts: dict[str, int] = {}
+        self._recording_confirmed_rooms: set[str] = set()
+        self._recording_check_results: dict[str, dict[str, object]] = {}
         self._stream_launch_retry_rooms: set[str] = set()
         self._lesson_not_started_rooms: set[str] = set()
         self._lesson_started_rooms: set[str] = set()
@@ -70,12 +86,14 @@ class MainController(QObject):
     def _connect(self) -> None:
         self.main_window.refresh_requested.connect(self.refresh_schedule)
         self.main_window.launch_requested.connect(self.launch_selected)
-        self.main_window.close_streams_requested.connect(self.close_stream_windows)
         self.main_window.settings_requested.connect(self.open_settings)
         self.main_window.notifications_requested.connect(self.show_notifications)
         self.main_window.vk_login_requested.connect(self.open_vk_login)
         self.main_window.vk_auth_check_requested.connect(self.check_vk_auth_status)
         self.notification_window.mute_all_requested.connect(self.set_all_stream_audio_muted)
+        self.notification_window.close_streams_requested.connect(self.close_stream_windows)
+        self.notification_window.record_all_requested.connect(self.record_all_streams)
+        self.notification_window.auto_recording_changed.connect(self.set_auto_recording)
         self.vk_auth_checker.finished.connect(self._on_vk_auth_checked)
         self.bridge.schedule_loaded.connect(self._on_schedule_loaded)
         self.bridge.schedule_failed.connect(self._on_schedule_failed)
@@ -84,6 +102,7 @@ class MainController(QObject):
     def _setup_scheduler(self) -> None:
         self.scheduler_timer = QTimer(self)
         self.scheduler_timer.timeout.connect(self._check_launch_schedule)
+        self.scheduler_timer.timeout.connect(self._check_recording_schedule)
         self.scheduler_timer.start(30_000)
         self.cleanup_timer = QTimer(self)
         self.cleanup_timer.timeout.connect(lambda: self._cleanup_results_folder("по таймеру"))
@@ -177,6 +196,10 @@ class MainController(QObject):
         self.stream_windows.clear()
         self._focused_stream_room = None
         self._focus_geometry_change = False
+        self._recording_generation += 1
+        self._recording_attempts.clear()
+        self._recording_confirmed_rooms.clear()
+        self._recording_check_results.clear()
         self._stream_launch_retry_rooms.clear()
         self._lesson_not_started_rooms.clear()
         self._lesson_started_rooms.clear()
@@ -239,18 +262,15 @@ class MainController(QObject):
         if self._focused_stream_room:
             return
         screens, notification_placement = _screens_with_notification_strip()
-        placements = compute_window_placements(screens, len(self.stream_windows))
-        for window, placement in zip(self.stream_windows.values(), placements):
-            window.set_focus_mode_active(False)
-            if window.isMaximized() or window.isMinimized():
-                window.showNormal()
-            window.show()
-            window.setGeometry(QRect(placement.x, placement.y, placement.width, placement.height))
+        placements = list(zip(self.stream_windows.values(), compute_window_placements(screens, len(self.stream_windows))))
+        self._focus_transition_id += 1
+        transition_id = self._focus_transition_id
+        self._focus_geometry_change = True
         self.notification_window.set_compact_mode(True)
         self.notification_window.setGeometry(QRect(notification_placement.x, notification_placement.y, notification_placement.width, notification_placement.height))
         self.notification_window.show()
         self.notification_window.raise_()
-        self.main_window.append_log(f"Окна трансляций перестроены: осталось {len(self.stream_windows)}.")
+        self._reflow_stream_windows_batch(placements, transition_id, 0)
 
     @Slot(str)
     def _enter_stream_focus_mode(self, room: str) -> None:
@@ -292,22 +312,81 @@ class MainController(QObject):
         if window is None:
             return
         focus_rect = self._focus_rect_for_window(window)
+        self._focus_transition_id += 1
+        transition_id = self._focus_transition_id
         self._focus_geometry_change = True
         try:
-            for other_room, other_window in self.stream_windows.items():
-                if other_room != room:
-                    other_window.set_focus_mode_active(False)
-                    other_window.hide()
-            if window.isMaximized() or window.isMinimized():
-                window.showNormal()
-            window.setGeometry(focus_rect)
+            self._place_stream_window(window, focus_rect, show=True)
             window.set_focus_mode_active(True)
-            window.show()
             window.raise_()
             window.activateWindow()
         finally:
-            QTimer.singleShot(0, lambda: setattr(self, "_focus_geometry_change", False))
+            QTimer.singleShot(0, lambda transition_id=transition_id: self._finish_focus_geometry_change(transition_id))
+        QTimer.singleShot(0, lambda room=room, transition_id=transition_id: self._hide_non_focused_streams(room, transition_id))
         self.notification_window.raise_()
+
+    def _reflow_stream_windows_batch(
+        self,
+        placements: list[tuple[StreamWindow, WindowPlacement]],
+        transition_id: int,
+        start_index: int,
+    ) -> None:
+        if transition_id != self._focus_transition_id or self._focused_stream_room:
+            return
+        end_index = min(start_index + _WINDOW_TRANSITION_BATCH_SIZE, len(placements))
+        for window, placement in placements[start_index:end_index]:
+            if window.stream.room not in self.stream_windows:
+                continue
+            window.set_focus_mode_active(False)
+            rect = QRect(placement.x, placement.y, placement.width, placement.height)
+            self._place_stream_window(window, rect, show=True)
+        if end_index < len(placements):
+            QTimer.singleShot(
+                _WINDOW_TRANSITION_BATCH_INTERVAL_MS,
+                lambda placements=placements, transition_id=transition_id, end_index=end_index: self._reflow_stream_windows_batch(
+                    placements,
+                    transition_id,
+                    end_index,
+                ),
+            )
+            return
+        self._finish_focus_geometry_change(transition_id)
+        self.main_window.append_log(f"Окна трансляций перестроены: осталось {len(self.stream_windows)}.")
+
+    def _hide_non_focused_streams(self, room: str, transition_id: int) -> None:
+        if transition_id != self._focus_transition_id or self._focused_stream_room != room:
+            return
+        hidden_count = 0
+        for other_room, other_window in self.stream_windows.items():
+            if other_room == room or not other_window.isVisible():
+                continue
+            other_window.set_focus_mode_active(False)
+            other_window.hide()
+            hidden_count += 1
+            if hidden_count >= _WINDOW_TRANSITION_BATCH_SIZE:
+                break
+        has_visible_others = any(other_room != room and window.isVisible() for other_room, window in self.stream_windows.items())
+        if has_visible_others:
+            QTimer.singleShot(
+                _WINDOW_TRANSITION_BATCH_INTERVAL_MS,
+                lambda room=room, transition_id=transition_id: self._hide_non_focused_streams(room, transition_id),
+            )
+
+    def _place_stream_window(self, window: StreamWindow, rect: QRect, show: bool) -> None:
+        updates_enabled = window.updatesEnabled()
+        window.setUpdatesEnabled(False)
+        try:
+            if window.isMaximized() or window.isMinimized():
+                window.showNormal()
+            window.setGeometry(rect)
+            if show:
+                window.show()
+        finally:
+            window.setUpdatesEnabled(updates_enabled)
+
+    def _finish_focus_geometry_change(self, transition_id: int) -> None:
+        if transition_id == self._focus_transition_id:
+            self._focus_geometry_change = False
 
     def _focus_rect_for_window(self, window: StreamWindow) -> QRect:
         screens, notification_placement = _screens_with_notification_strip()
@@ -361,6 +440,158 @@ class MainController(QObject):
             self._stream_launch_retry_rooms.discard(room)
             self.notification_window.add_event("Предупреждение", room, f"{room} - повторное подключение")
             self.main_window.append_log(f"{room}: подключение не подтвердилось, страница перезапущена.")
+        elif state == "manual_reloaded":
+            self._stream_launch_retry_rooms.discard(room)
+            self.main_window.append_log(f"{room}: вкладка обновлена вручную, повторяю подключение.")
+
+    @Slot()
+    def record_all_streams(self) -> None:
+        self._start_recording_on_all_streams("ручной запуск")
+
+    @Slot(bool, int, int)
+    def set_auto_recording(self, enabled: bool, hour: int, minute: int) -> None:
+        was_enabled = self._auto_recording_enabled
+        old_time = (self._auto_recording_hour, self._auto_recording_minute)
+        if not enabled and not was_enabled:
+            return
+        self._auto_recording_enabled = bool(enabled)
+        self._auto_recording_hour = max(0, min(23, int(hour)))
+        self._auto_recording_minute = max(0, min(59, int(minute)))
+        now = now_moscow()
+        record_dt = _recording_datetime_for_today(self._auto_recording_hour, self._auto_recording_minute, now)
+        if self._auto_recording_enabled and not _recording_time_is_valid(self._auto_recording_hour, self._auto_recording_minute, now):
+            self._auto_recording_enabled = False
+            self.notification_window.add_event(
+                "Предупреждение",
+                "",
+                "Интервал автозаписи не действителен",
+                f"Выбранное время уже прошло сегодня: {record_dt.strftime('%d.%m.%Y %H:%M')}.",
+            )
+            self.main_window.append_log(f"Автозапись не включена: время уже прошло ({record_dt.strftime('%H:%M')}).")
+            return
+        if self._auto_recording_enabled and (not was_enabled or old_time != (self._auto_recording_hour, self._auto_recording_minute)):
+            self._last_auto_recording_date = ""
+        if self._auto_recording_enabled:
+            self.main_window.append_log(f"Автозапись включена на {self._auto_recording_hour:02d}:{self._auto_recording_minute:02d}.")
+            self.notification_window.add_event(
+                "Информация",
+                "",
+                f"Автозапись включена: {self._auto_recording_hour:02d}:{self._auto_recording_minute:02d}",
+            )
+        else:
+            self.main_window.append_log("Автозапись выключена.")
+            self.notification_window.add_event("Информация", "", "Автозапись выключена")
+
+    def _start_recording_on_all_streams(self, reason: str) -> None:
+        if not self.stream_windows:
+            self.notification_window.add_event("Предупреждение", "", "Нет открытых вкладок для записи")
+            self.main_window.append_log("Запись не поставлена: нет открытых вкладок трансляций.")
+            return
+        self._recording_generation += 1
+        generation = self._recording_generation
+        self._recording_attempts = {room: 0 for room in self.stream_windows}
+        self._recording_confirmed_rooms.clear()
+        self._recording_check_results.clear()
+        self.notification_window.add_event("Информация", "", f"Постановка записи: {len(self.stream_windows)} вкладок", reason)
+        self.main_window.append_log(f"Запускаю постановку записи на {len(self.stream_windows)} вкладках ({reason}).")
+        for room in list(self.stream_windows.keys()):
+            self._request_stream_recording(room, generation)
+        QTimer.singleShot(_RECORDING_VERIFY_DELAY_MS, lambda generation=generation: self._verify_stream_recordings(generation))
+
+    def _request_stream_recording(self, room: str, generation: int) -> None:
+        if generation != self._recording_generation:
+            return
+        window = self.stream_windows.get(room)
+        if window is None:
+            return
+        self._recording_attempts[room] = self._recording_attempts.get(room, 0) + 1
+        title = _recording_title(window.stream.room)
+        window.ensure_call_recording(
+            title,
+            lambda result, room=room, generation=generation: self._on_recording_request_result(generation, room, result),
+        )
+
+    def _on_recording_request_result(self, generation: int, room: str, result: dict[str, object]) -> None:
+        if generation != self._recording_generation or room not in self.stream_windows:
+            return
+        state = str(result.get("state", "unknown"))
+        title = str(result.get("title", _recording_title(room)))
+        attempt = self._recording_attempts.get(room, 1)
+        if result.get("recording"):
+            self._recording_confirmed_rooms.add(room)
+            self.notification_window.add_event("Проверка", room, f"{room} - запись уже идёт")
+            self.main_window.append_log(f"{room}: запись уже идёт или поставлена. Название: {title}.")
+            return
+        if state in {"record_requested", "command_started"}:
+            self.notification_window.add_event("Информация", room, f"{room} - команда записи отправлена")
+            self.main_window.append_log(f"{room}: команда записи отправлена. Попытка {attempt}.")
+            return
+        self.notification_window.add_event(
+            "Предупреждение",
+            room,
+            f"{room} - запись не поставилась сразу",
+            _recording_state_message(state),
+        )
+        self.main_window.append_log(f"{room}: не удалось сразу поставить запись ({state}). Попытка {attempt}.")
+
+    def _verify_stream_recordings(self, generation: int) -> None:
+        if generation != self._recording_generation:
+            return
+        rooms = [room for room in self._recording_attempts if room in self.stream_windows]
+        if not rooms:
+            return
+        self._recording_check_results = {}
+        for room in rooms:
+            window = self.stream_windows.get(room)
+            if window is None:
+                continue
+            window.inspect_recording_state(
+                lambda result, room=room, generation=generation: self._on_recording_state_checked(generation, room, result)
+            )
+        QTimer.singleShot(
+            _RECORDING_VERIFY_CALLBACK_WAIT_MS,
+            lambda generation=generation, rooms=rooms: self._finish_recording_verification(generation, rooms),
+        )
+
+    def _on_recording_state_checked(self, generation: int, room: str, result: dict[str, object]) -> None:
+        if generation != self._recording_generation:
+            return
+        self._recording_check_results[room] = result
+
+    def _finish_recording_verification(self, generation: int, rooms: list[str]) -> None:
+        if generation != self._recording_generation:
+            return
+        retry_rooms: list[str] = []
+        failed_rooms: list[str] = []
+        for room in rooms:
+            if room not in self.stream_windows:
+                continue
+            result = self._recording_check_results.get(room, {"recording": False, "state": "no_callback"})
+            if result.get("recording"):
+                if room not in self._recording_confirmed_rooms:
+                    self.notification_window.add_event("Проверка", room, f"{room} - запись идёт")
+                    self.main_window.append_log(f"{room}: проверка подтвердила, запись идёт.")
+                self._recording_confirmed_rooms.add(room)
+                continue
+            if self._recording_attempts.get(room, 0) < _MAX_RECORDING_ATTEMPTS:
+                retry_rooms.append(room)
+            else:
+                failed_rooms.append(room)
+
+        for room in retry_rooms:
+            self.notification_window.add_event("Предупреждение", room, f"{room} - запись не включилась, повторяю")
+            self.main_window.append_log(f"{room}: запись не подтвердилась через 30 секунд, повторяю постановку.")
+            self._request_stream_recording(room, generation)
+
+        for room in failed_rooms:
+            self.notification_window.add_event("Ошибка", room, f"{room} - запись не включилась", "Достигнут лимит повторных попыток.")
+            self.main_window.append_log(f"{room}: запись не включилась после {_MAX_RECORDING_ATTEMPTS} попыток.")
+
+        if retry_rooms:
+            QTimer.singleShot(_RECORDING_VERIFY_DELAY_MS, lambda generation=generation: self._verify_stream_recordings(generation))
+        elif not failed_rooms:
+            self.notification_window.add_event("Информация", "", "Запись включена на всех вкладках")
+            self.main_window.append_log("Запись подтверждена на всех открытых вкладках.")
 
     def _check_stream_launch(self, room: str) -> None:
         window = self.stream_windows.get(room)
@@ -641,6 +872,26 @@ class MainController(QObject):
             self.last_auto_launch_date = today
             self.launch_selected()
 
+    def _check_recording_schedule(self) -> None:
+        if not self._auto_recording_enabled:
+            return
+        now = now_moscow()
+        today = now.strftime("%Y-%m-%d")
+        if self._last_auto_recording_date == today:
+            return
+        record_dt = now.replace(
+            hour=self._auto_recording_hour,
+            minute=self._auto_recording_minute,
+            second=0,
+            microsecond=0,
+        )
+        if record_dt <= now < record_dt + timedelta(minutes=5):
+            if not self.stream_windows:
+                self.main_window.append_log("Автозапись ждёт открытые вкладки трансляций.")
+                return
+            self._last_auto_recording_date = today
+            self._start_recording_on_all_streams("автозапуск по времени")
+
     def _show_prelaunch_prompt(self) -> None:
         self.refresh_schedule()
         self.main_window.bring_to_front()
@@ -706,6 +957,40 @@ def _screens_with_notification_strip(strip_width: int = 240) -> tuple[list[Scree
         else:
             adjusted.append(screen)
     return adjusted, notification_rect
+
+
+def _recording_title(room: str, date_text: str | None = None) -> str:
+    normalized_room = _recording_room_name(room)
+    current_date = date_text or now_moscow().strftime("%d_%m_%Y")
+    return f"{normalized_room} {current_date}"
+
+
+def _recording_datetime_for_today(hour: int, minute: int, now: datetime | None = None) -> datetime:
+    now = now or now_moscow()
+    return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
+def _recording_time_is_valid(hour: int, minute: int, now: datetime | None = None) -> bool:
+    now = now or now_moscow()
+    record_dt = _recording_datetime_for_today(hour, minute, now)
+    return record_dt > now
+
+
+def _recording_room_name(room: str) -> str:
+    return room.replace("-", "").replace("–", "").replace("—", "").replace(" ", "")
+
+
+def _recording_state_message(state: str) -> str:
+    messages = {
+        "gear_not_found": "Не нашлась шестерёнка настроек звонка.",
+        "title_field_not_found": "Окно записи открылось, но поле названия не найдено.",
+        "submit_not_found": "Окно записи открылось, но кнопка подтверждения не найдена.",
+        "record_action_not_found": "Меню настроек открылось, но пункт записи звонка не найден.",
+        "record_dialog_not_opened": "Пункт записи найден, но окно создания записи не открылось.",
+        "closed": "Вкладка закрыта.",
+        "unknown": "Не удалось получить результат команды.",
+    }
+    return messages.get(state, f"Состояние: {state}")
 
 
 def _summary_waits_for_video(summary: AnalysisSummary) -> bool:
