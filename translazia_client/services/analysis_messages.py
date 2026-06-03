@@ -8,6 +8,32 @@ def short_analysis_message(room: str, summary: Any = None, error: str = "") -> s
     return f"{room} - {problem}" if room else problem
 
 
+def analysis_problem_category(summary: Any = None, error: str = "", message: str = "", details: str = "") -> str:
+    if error:
+        return _category_from_text(error)
+
+    payload = getattr(summary, "payload", {}) if summary is not None else {}
+    problems = payload.get("проблемы", []) if isinstance(payload, dict) else []
+    categories: set[str] = set()
+    if isinstance(problems, list):
+        for problem in problems:
+            if isinstance(problem, dict):
+                categories.add(_problem_category(problem))
+
+    categories.discard("general")
+    if "audio" in categories and "video" in categories:
+        return "mixed"
+    if "audio" in categories:
+        return "audio"
+    if "video" in categories:
+        return "video"
+    if getattr(summary, "issues_count", 0):
+        return _category_from_text(f"{message} {details} {short_problem(summary)}")
+    if summary is not None:
+        return "ok"
+    return _category_from_text(f"{message} {details}")
+
+
 def short_problem(summary: Any = None, error: str = "") -> str:
     if error:
         return _short_error(error)
@@ -66,6 +92,20 @@ def _problem_label(problem: dict[str, Any]) -> str:
     return _video_label(text)
 
 
+def _problem_category(problem: dict[str, Any]) -> str:
+    source = str(problem.get("источник", "")).lower()
+    code = str(problem.get("код", "")).lower()
+    text = " ".join(
+        str(problem.get(key, ""))
+        for key in ("тип", "описание", "решение", "состояние")
+    ).lower()
+    if source == "звук" or code in AUDIO_CODES:
+        return "audio"
+    if _category_from_text(text) == "audio":
+        return "audio"
+    return "video"
+
+
 AUDIO_CODES = {
     "empty_audio",
     "audio_not_checked",
@@ -121,6 +161,53 @@ def _short_error(error: str) -> str:
     if "frame" in lowered or "кадр" in lowered or "video" in lowered:
         return "нет видео"
     return "ошибка проверки"
+
+
+def _category_from_text(text: str) -> str:
+    lowered = text.lower()
+    if "занятие началось" in lowered or "всё хорошо" in lowered or "все хорошо" in lowered or "норма" in lowered:
+        return "ok"
+    if "занятие не началось" in lowered:
+        return "waiting"
+    if (
+        "не подключ" in lowered
+        or "не загруз" in lowered
+        or "перезапуск" in lowered
+        or "повторное подключ" in lowered
+        or "не удалось позвонить" in lowered
+    ):
+        return "connection"
+    audio_markers = (
+        "звук",
+        "аудио",
+        "audio",
+        "ffmpeg",
+        "тишин",
+        "речь",
+        "микрофон",
+        "громкость",
+        "шум",
+    )
+    video_markers = (
+        "видео",
+        "video",
+        "frame",
+        "кадр",
+        "экран",
+        "камера",
+        "преподавател",
+        "аудитор",
+        "изображ",
+    )
+    has_audio = any(marker in lowered for marker in audio_markers)
+    has_video = any(marker in lowered for marker in video_markers)
+    if has_audio and has_video:
+        return "mixed"
+    if has_audio:
+        return "audio"
+    if has_video:
+        return "video"
+    return "general"
 
 
 def _dedupe(items: list[str]) -> list[str]:

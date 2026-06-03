@@ -11,7 +11,7 @@ from translazia_client.controllers.main_controller import _screens_with_notifica
 from translazia_client.resources import APP_ICON_PATH, LOGO_PATH
 from translazia_client.config import SourceSettings
 from translazia_client.services.results_cleanup import cleanup_results_folder
-from translazia_client.services.analysis_messages import compact_analysis_details, short_analysis_message
+from translazia_client.services.analysis_messages import analysis_problem_category, compact_analysis_details, short_analysis_message
 from translazia_client.services.vk_auth_service import is_vk_session_cookie
 from translazia_client.services.time_service import moscow_timezone_name, now_moscow, parse_hhmm
 from translazia_client.services.vk_web_schedule import _extract_time, parse_vk_web_schedule
@@ -231,6 +231,23 @@ https://vk.com/call/join/example
 
         self.assertEqual(short_analysis_message("В-505", audio_summary), "В-505 - нет звука")
         self.assertEqual(short_analysis_message("В-502", video_summary), "В-502 - нет видео")
+        self.assertEqual(analysis_problem_category(audio_summary), "audio")
+        self.assertEqual(analysis_problem_category(video_summary), "video")
+
+    def test_analysis_problem_category_for_mixed_issue(self) -> None:
+        summary = AnalysisSummary(
+            status="обнаружены проблемы",
+            message="long",
+            issues_count=2,
+            payload={
+                "проблемы": [
+                    {"источник": "звук", "код": "mostly_silence", "описание": "тишина"},
+                    {"источник": "видео", "тип": "Черный экран", "описание": "экран черный"},
+                ]
+            },
+        )
+
+        self.assertEqual(analysis_problem_category(summary), "mixed")
 
     def test_compact_analysis_details_hides_long_ffmpeg_error(self) -> None:
         details = compact_analysis_details(error="ffmpeg could not decode audio: Output file does not contain any stream")

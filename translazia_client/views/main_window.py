@@ -25,7 +25,8 @@ from PySide6.QtWidgets import (
 )
 
 from ..analysis import AnalysisSummary
-from ..services.analysis_messages import short_analysis_message
+from ..services.analysis_messages import analysis_problem_category, short_analysis_message
+from ..services.client_logger import log_event
 from ..config import AppSettings
 from ..models import StreamRoom
 from ..resources import LOGO_SMALL_PATH, app_icon
@@ -296,17 +297,14 @@ class MainWindow(QMainWindow):
         if error:
             self.analysis_table.setItem(row, 2, QTableWidgetItem(short_analysis_message(room, error=error)))
             self.analysis_table.setItem(row, 3, QTableWidgetItem("—"))
-            row_background = "#fff1ee"
-            row_foreground = "#8b2f28"
+            row_background, row_foreground = _analysis_colors(analysis_problem_category(error=error))
         elif summary:
             self.analysis_table.setItem(row, 2, QTableWidgetItem(short_analysis_message(room, summary)))
             self.analysis_table.setItem(row, 3, QTableWidgetItem(str(summary.issues_count)))
             if summary.issues_count:
-                row_background = "#fff4d8"
-                row_foreground = "#7a4f00"
+                row_background, row_foreground = _analysis_colors(analysis_problem_category(summary))
             else:
-                row_background = "#eff8f1"
-                row_foreground = "#245a3d"
+                row_background, row_foreground = _analysis_colors("ok")
         else:
             self.analysis_table.setItem(row, 2, QTableWidgetItem("Нет результата"))
             self.analysis_table.setItem(row, 3, QTableWidgetItem("—"))
@@ -326,6 +324,7 @@ class MainWindow(QMainWindow):
     def append_log(self, message: str) -> None:
         stamp = datetime.now().strftime("%H:%M:%S")
         self.raw_log.append(f"[{stamp}] {message}")
+        log_event(message)
 
     def show_status(self, message: str, timeout_ms: int = 7000) -> None:
         self.statusBar().showMessage(message, timeout_ms)
@@ -348,3 +347,15 @@ class MainWindow(QMainWindow):
 
 def _stream_key(stream: StreamRoom) -> str:
     return f"{stream.room}|{stream.url}"
+
+
+def _analysis_colors(category: str) -> tuple[str, str]:
+    if category == "audio":
+        return "#e8f2ff", "#064f9f"
+    if category == "video":
+        return "#fff3df", "#8a4b00"
+    if category == "mixed":
+        return "#f1e9ff", "#5d2d91"
+    if category == "ok":
+        return "#eff8f1", "#245a3d"
+    return "#fff1ee", "#8b2f28"

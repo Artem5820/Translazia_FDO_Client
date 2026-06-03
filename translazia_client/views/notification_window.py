@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from html import escape
 from typing import Any
 
 from PySide6.QtCore import Qt, Signal, Slot
@@ -23,7 +24,8 @@ from PySide6.QtWidgets import (
 
 from ..analysis import AnalysisSummary
 from ..resources import LOGO_SMALL_PATH, app_icon
-from ..services.analysis_messages import compact_analysis_details, short_analysis_message
+from ..services.analysis_messages import analysis_problem_category, compact_analysis_details, short_analysis_message
+from ..services.client_logger import log_event
 
 
 class NotificationWindow(QMainWindow):
@@ -127,6 +129,8 @@ class NotificationWindow(QMainWindow):
         self.compact_log = QTextEdit()
         self.compact_log.setObjectName("stripLog")
         self.compact_log.setReadOnly(True)
+        self.compact_log.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.compact_log.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.compact_log.setPlaceholderText("События и ошибки")
         compact_layout.addWidget(compact_logo)
         compact_layout.addWidget(self.compact_total)
@@ -151,7 +155,7 @@ class NotificationWindow(QMainWindow):
         self.badge.setText("Событий пока нет")
         self._update_compact_counts()
 
-    def add_event(self, level: str, room: str, message: str, details: str = "") -> None:
+    def add_event(self, level: str, room: str, message: str, details: str = "", category: str = "") -> None:
         self.total_events += 1
         if level == "Ошибка":
             self.error_events += 1
@@ -159,23 +163,29 @@ class NotificationWindow(QMainWindow):
             self.neural_events += 1
         row = self.table.rowCount()
         self.table.insertRow(row)
-        values = [datetime.now().strftime("%H:%M:%S"), level, room or "—", message]
-        color = _level_color(level)
+        display_message = _message_without_room(message, room)
+        values = [datetime.now().strftime("%H:%M:%S"), level, room or "—", display_message]
+        event_category = category or analysis_problem_category(message=message, details=details)
+        color = _event_color(level, event_category)
+        background = _event_background(event_category)
         for column, value in enumerate(values):
             item = QTableWidgetItem(value)
             if color is not None:
                 item.setForeground(QBrush(color))
+            if background is not None:
+                item.setBackground(QBrush(background))
             self.table.setItem(row, column, item)
         self.table.scrollToBottom()
         self.badge.setText(
             f"Событий: {self.total_events}; ошибок: {self.error_events}; находок нейросети: {self.neural_events}"
         )
-        self._append_compact_event(values[0], level, room, message, details)
+        self._append_compact_event(values[0], level, room, display_message, details, event_category)
         self._update_compact_counts()
         if details:
             self.details.append(f"[{values[0]}] {level} {room or 'система'}")
             self.details.append(details)
             self.details.append("")
+        log_event(f"{level} | {room or 'система'} | {message}" + (f" | {details}" if details else ""), level)
 
     def set_compact_mode(self, compact: bool) -> None:
         if self.compact_mode == compact:
@@ -220,32 +230,58 @@ class NotificationWindow(QMainWindow):
             f"Событий: {self.total_events}\nОшибок: {self.error_events}\nНаходок нейросети: {self.neural_events}"
         )
 
-    def _append_compact_event(self, stamp: str, level: str, room: str, message: str, details: str) -> None:
+    def _append_compact_event(self, stamp: str, level: str, room: str, message: str, details: str, category: str) -> None:
+        scrollbar = self.compact_log.verticalScrollBar()
+        old_scroll_value = scrollbar.value()
+        should_autoscroll = scrollbar.value() >= scrollbar.maximum() - 8
         room_text = room or "система"
-        line = f"[{stamp}] {room_text}: {message}" if room else f"[{stamp}] {message}"
+        title = f"{room_text}: {message}" if room else message
+        if room and message.lower().startswith(room.lower()):
+            title = f"{room_text}: {_message_without_room(message, room)}"
+        color = _event_hex_color(level, category)
+        background = _event_hex_background(category)
+        details_line = ""
+        if details:
+            compact_details = _first_compact_detail(details)
+            if compact_details:
+                details_line = f"<div class='details'>{escape(compact_details)}</div>"
+        line = (
+            f"<div class='event' style='border-left-color:{color};background:{background};'>"
+            f"<div class='meta'>[{escape(stamp)}] {escape(level)}</div>"
+            f"<div class='title' style='color:{color};'>{escape(title)}</div>"
+            f"{details_line}"
+            "</div>"
+        )
         self.compact_lines.append(line)
-        self.compact_lines = self.compact_lines[-12:]
-        self.compact_log.setPlainText("\n\n".join(self.compact_lines))
-        self.compact_log.verticalScrollBar().setValue(self.compact_log.verticalScrollBar().maximum())
+        self.compact_lines = self.compact_lines[-500:]
+        self.compact_log.setHtml(_compact_log_html(self.compact_lines))
+        if should_autoscroll:
+            self.compact_log.verticalScrollBar().setValue(self.compact_log.verticalScrollBar().maximum())
+        else:
+            scrollbar = self.compact_log.verticalScrollBar()
+            scrollbar.setValue(min(old_scroll_value, scrollbar.maximum()))
 
     def add_analysis_result(self, room: str, video_path: str, summary: AnalysisSummary | None, error: str) -> None:
         if error:
-            self.add_event("Ошибка", room, short_analysis_message(room, error=error), compact_analysis_details(error=error, video_path=video_path))
+            category = analysis_problem_category(error=error)
+            self.add_event("Ошибка", room, short_analysis_message(room, error=error), compact_analysis_details(error=error, video_path=video_path), category)
             return
         if summary is None:
             self.add_event("Ошибка", room, f"{room} - нет результата", video_path)
             return
 
         if summary.issues_count > 0:
+            category = analysis_problem_category(summary)
             self.add_event(
                 "Нейросеть",
                 room,
                 short_analysis_message(room, summary),
                 compact_analysis_details(summary, video_path=video_path),
+                category,
             )
             return
 
-        self.add_event("Проверка", room, f"{room} - норма", summary.message)
+        self.add_event("Проверка", room, f"{room} - норма", summary.message, "ok")
 
     def export_dialog(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
@@ -276,7 +312,19 @@ class NotificationWindow(QMainWindow):
             file.write("\n".join(lines))
 
 
-def _level_color(level: str) -> QColor | None:
+def _event_color(level: str, category: str = "") -> QColor | None:
+    if category == "audio":
+        return QColor("#064f9f")
+    if category == "video":
+        return QColor("#8a4b00")
+    if category == "mixed":
+        return QColor("#5d2d91")
+    if category == "ok":
+        return QColor("#245a3d")
+    if category == "waiting":
+        return QColor("#4f6478")
+    if category == "connection":
+        return QColor("#8a4b00")
     if level in {"Ошибка", "Нейросеть"}:
         return QColor("#8b2f28")
     if level == "Предупреждение":
@@ -284,6 +332,96 @@ def _level_color(level: str) -> QColor | None:
     if level == "Проверка":
         return QColor("#2e6d50")
     return None
+
+
+def _event_background(category: str = "") -> QColor | None:
+    if category == "audio":
+        return QColor("#e8f2ff")
+    if category == "video":
+        return QColor("#fff3df")
+    if category == "mixed":
+        return QColor("#f1e9ff")
+    if category == "ok":
+        return QColor("#eff8f1")
+    if category == "waiting":
+        return QColor("#eef3f8")
+    if category == "connection":
+        return QColor("#fff6e8")
+    return None
+
+
+def _event_hex_color(level: str, category: str = "") -> str:
+    color = _event_color(level, category)
+    return color.name() if color is not None else "#102033"
+
+
+def _event_hex_background(category: str = "") -> str:
+    color = _event_background(category)
+    return color.name() if color is not None else "#ffffff"
+
+
+def _message_without_room(message: str, room: str) -> str:
+    text = message.strip()
+    if not room:
+        return text
+    prefixes = (
+        f"{room}:",
+        f"{room} -",
+        f"{room} —",
+        f"{room} –",
+    )
+    lowered = text.lower()
+    for prefix in prefixes:
+        if lowered.startswith(prefix.lower()):
+            return text[len(prefix) :].strip()
+    return text
+
+
+def _first_compact_detail(details: str) -> str:
+    for raw_line in details.splitlines():
+        line = raw_line.strip()
+        if line and not line.lower().startswith("фрагмент:"):
+            return line[:120]
+    return ""
+
+
+def _compact_log_html(lines: list[str]) -> str:
+    body = "".join(lines)
+    return f"""
+<html>
+<head>
+<style>
+body {{
+    margin: 0;
+    font-family: "Segoe UI", Arial, sans-serif;
+    font-size: 12px;
+    color: #102033;
+}}
+.event {{
+    border-left: 4px solid #102033;
+    border-radius: 7px;
+    margin: 0 0 8px 0;
+    padding: 7px 8px;
+}}
+.meta {{
+    color: #5d7191;
+    font-size: 11px;
+    margin-bottom: 3px;
+}}
+.title {{
+    font-weight: 700;
+    line-height: 1.35;
+}}
+.details {{
+    color: #4d617d;
+    margin-top: 3px;
+    line-height: 1.3;
+}}
+</style>
+</head>
+<body>{body}</body>
+</html>
+"""
 
 
 def _format_problem_details(payload: dict[str, Any]) -> str:
