@@ -14,7 +14,7 @@ from ..config import DATA_DIR, AppSettings, load_settings, save_settings
 from ..layout import ScreenRect, compute_window_placements
 from ..models import StreamRoom
 from ..services.healthcheck import run_startup_healthcheck
-from ..services.analysis_messages import short_analysis_message
+from ..services.analysis_messages import short_analysis_message, short_problem
 from ..services.results_cleanup import cleanup_results_folder
 from ..services.schedule_service import load_streams
 from ..services.time_service import now_moscow, parse_hhmm
@@ -44,7 +44,11 @@ class MainController(QObject):
         self._vk_schedule_request_id = 0
         self._all_stream_audio_muted = False
         self._focused_stream_room: str | None = None
+        self._focus_geometry_change = False
         self._stream_launch_retry_rooms: set[str] = set()
+        self._lesson_not_started_rooms: set[str] = set()
+        self._lesson_started_rooms: set[str] = set()
+        self._lesson_ended_rooms: set[str] = set()
         self.stream_windows: dict[str, StreamWindow] = {}
         self._retired_stream_windows: list[StreamWindow] = []
         self._stream_close_queue: list[StreamWindow] = []
@@ -129,6 +133,9 @@ class MainController(QObject):
             self.main_window.show_info("Нет аудиторий", "Отметьте хотя бы одну аудиторию для запуска.")
             return
         self.close_stream_windows()
+        self._lesson_not_started_rooms = set()
+        self._lesson_started_rooms = set()
+        self._lesson_ended_rooms = set()
         screens, notification_placement = _screens_with_notification_strip()
         stream_placements = compute_window_placements(screens, len(selected))
 
@@ -142,6 +149,7 @@ class MainController(QObject):
             window.focus_mode_exited.connect(self._exit_stream_focus_mode)
             window.next_stream_requested.connect(lambda room, step=1: self._switch_focused_stream(room, step))
             window.previous_stream_requested.connect(lambda room, step=-1: self._switch_focused_stream(room, step))
+            window.multiwindow_requested.connect(self._exit_stream_focus_mode)
             window.closed.connect(self._on_stream_window_closed)
             window.show()
             self.stream_windows[stream.room] = window
@@ -168,7 +176,11 @@ class MainController(QObject):
         closing_windows = list(self.stream_windows.values())
         self.stream_windows.clear()
         self._focused_stream_room = None
+        self._focus_geometry_change = False
         self._stream_launch_retry_rooms.clear()
+        self._lesson_not_started_rooms.clear()
+        self._lesson_started_rooms.clear()
+        self._lesson_ended_rooms.update(window.stream.room for window in closing_windows)
         for window in closing_windows:
             try:
                 window.closed.disconnect(self._on_stream_window_closed)
@@ -185,6 +197,7 @@ class MainController(QObject):
             try:
                 window.focus_mode_requested.disconnect(self._enter_stream_focus_mode)
                 window.focus_mode_exited.disconnect(self._exit_stream_focus_mode)
+                window.multiwindow_requested.disconnect(self._exit_stream_focus_mode)
             except (RuntimeError, TypeError):
                 pass
             window.prepare_for_close(emit_closed=False)
@@ -204,15 +217,22 @@ class MainController(QObject):
 
     @Slot(str)
     def _on_stream_window_closed(self, room: str) -> None:
+        was_focused = self._focused_stream_room == room
         window = self.stream_windows.pop(room, None)
+        self._lesson_not_started_rooms.discard(room)
+        self._lesson_started_rooms.discard(room)
+        self._lesson_ended_rooms.add(room)
         if window is not None and window not in self._retired_stream_windows:
             self._retired_stream_windows.append(window)
         if not self.stream_windows:
             self.notification_window.set_compact_mode(False)
             self.main_window.append_log("Все окна трансляций закрыты.")
             return
-        if self._focused_stream_room == room:
-            self._focused_stream_room = None
+        if was_focused:
+            self._focused_stream_room = next(iter(self.stream_windows))
+            self._show_focused_stream(self._focused_stream_room)
+            self.main_window.append_log(f"{room}: трансляция закрыта, открыта следующая аудитория.")
+            return
         self._reflow_stream_windows()
 
     def _reflow_stream_windows(self) -> None:
@@ -221,6 +241,7 @@ class MainController(QObject):
         screens, notification_placement = _screens_with_notification_strip()
         placements = compute_window_placements(screens, len(self.stream_windows))
         for window, placement in zip(self.stream_windows.values(), placements):
+            window.set_focus_mode_active(False)
             if window.isMaximized() or window.isMinimized():
                 window.showNormal()
             window.show()
@@ -239,18 +260,13 @@ class MainController(QObject):
         if self._focused_stream_room == room:
             return
         self._focused_stream_room = room
-        for other_room, other_window in self.stream_windows.items():
-            if other_room != room:
-                other_window.hide()
-        window.show()
-        window.showMaximized()
-        window.raise_()
-        window.activateWindow()
-        self.notification_window.raise_()
-        self.main_window.append_log(f"{room}: окно раскрыто. Переключение: стрелки влево/вправо.")
+        self._show_focused_stream(room)
+        self.main_window.append_log(f"{room}: окно раскрыто. Переключение: стрелки или кнопки по краям.")
 
     @Slot()
     def _exit_stream_focus_mode(self) -> None:
+        if self._focus_geometry_change:
+            return
         if not self._focused_stream_room:
             return
         self._focused_stream_room = None
@@ -265,17 +281,50 @@ class MainController(QObject):
         current = self.stream_windows.get(room)
         index = rooms.index(room)
         target_room = rooms[(index + step) % len(rooms)]
-        target = self.stream_windows.get(target_room)
-        if target is None:
-            return
-        if current is not None and current is not target:
+        if current is not None:
             current.hide()
+            current.set_focus_mode_active(False)
         self._focused_stream_room = target_room
-        target.show()
-        target.showMaximized()
-        target.raise_()
-        target.activateWindow()
+        self._show_focused_stream(target_room)
+
+    def _show_focused_stream(self, room: str) -> None:
+        window = self.stream_windows.get(room)
+        if window is None:
+            return
+        focus_rect = self._focus_rect_for_window(window)
+        self._focus_geometry_change = True
+        try:
+            for other_room, other_window in self.stream_windows.items():
+                if other_room != room:
+                    other_window.set_focus_mode_active(False)
+                    other_window.hide()
+            if window.isMaximized() or window.isMinimized():
+                window.showNormal()
+            window.setGeometry(focus_rect)
+            window.set_focus_mode_active(True)
+            window.show()
+            window.raise_()
+            window.activateWindow()
+        finally:
+            QTimer.singleShot(0, lambda: setattr(self, "_focus_geometry_change", False))
         self.notification_window.raise_()
+
+    def _focus_rect_for_window(self, window: StreamWindow) -> QRect:
+        screens, notification_placement = _screens_with_notification_strip()
+        fallback = screens[0]
+        center = window.geometry().center()
+        chosen = fallback
+        for screen in screens:
+            rect = QRect(screen.x, screen.y, screen.width, screen.height)
+            if rect.contains(center):
+                chosen = screen
+                break
+        self.notification_window.set_compact_mode(True)
+        self.notification_window.setGeometry(
+            QRect(notification_placement.x, notification_placement.y, notification_placement.width, notification_placement.height)
+        )
+        self.notification_window.show()
+        return QRect(chosen.x, chosen.y, chosen.width, chosen.height)
 
     @Slot(bool)
     def set_all_stream_audio_muted(self, muted: bool) -> None:
@@ -304,6 +353,14 @@ class MainController(QObject):
         elif state == "connected":
             self._stream_launch_retry_rooms.discard(room)
             self.main_window.append_log(f"{room}: трансляция открыта.")
+        elif state == "call_error_reloaded":
+            self._stream_launch_retry_rooms.discard(room)
+            self.notification_window.add_event("Предупреждение", room, f"{room} - перезапуск звонка")
+            self.main_window.append_log(f"{room}: VK показал ошибку звонка, страница перезапущена.")
+        elif state == "join_timeout_reloaded":
+            self._stream_launch_retry_rooms.discard(room)
+            self.notification_window.add_event("Предупреждение", room, f"{room} - повторное подключение")
+            self.main_window.append_log(f"{room}: подключение не подтвердилось, страница перезапущена.")
 
     def _check_stream_launch(self, room: str) -> None:
         window = self.stream_windows.get(room)
@@ -481,7 +538,14 @@ class MainController(QObject):
 
     @Slot(str, str, object, str)
     def _on_analysis_finished(self, room: str, path: str, summary_obj: object, error: str) -> None:
+        if room not in self.stream_windows:
+            self.main_window.append_log(f"{room}: вкладка закрыта, результат проверки не учитывается.")
+            return
         summary = summary_obj if isinstance(summary_obj, AnalysisSummary) else None
+
+        if summary is not None and self._handle_lesson_start_state(room, path, summary):
+            return
+
         self.main_window.add_analysis_row(room, path, summary, error)
         self.notification_window.add_analysis_result(room, path, summary, error)
 
@@ -502,6 +566,42 @@ class MainController(QObject):
         window = self.stream_windows.get(room)
         if window:
             window.apply_analysis_result(summary, error)
+
+    def _handle_lesson_start_state(self, room: str, path: str, summary: AnalysisSummary) -> bool:
+        if room in self._lesson_started_rooms:
+            return False
+
+        if _summary_waits_for_video(summary):
+            if room not in self._lesson_not_started_rooms:
+                self._lesson_not_started_rooms.add(room)
+                message = f"{room} - занятие не началось"
+                self.notification_window.add_event("Проверка", room, message)
+                self.main_window.append_log(message)
+            return True
+
+        self._lesson_started_rooms.add(room)
+        was_waiting = room in self._lesson_not_started_rooms
+        self._lesson_not_started_rooms.discard(room)
+
+        if summary.issues_count == 0:
+            message = f"{room} - занятие началось, всё хорошо"
+        elif was_waiting:
+            message = f"{room} - занятие началось"
+        else:
+            message = ""
+        if message:
+            self.notification_window.add_event("Проверка", room, message)
+            self.main_window.append_log(message)
+
+        if summary.issues_count == 0:
+            self.main_window.add_analysis_row(room, path, summary, "")
+            self._write_payload(room, path, summary)
+            window = self.stream_windows.get(room)
+            if window:
+                window.apply_analysis_result(summary, "")
+            return True
+
+        return False
 
     def _write_payload(self, room: str, video_path: str, summary: AnalysisSummary) -> None:
         if not video_path:
@@ -606,3 +706,29 @@ def _screens_with_notification_strip(strip_width: int = 240) -> tuple[list[Scree
         else:
             adjusted.append(screen)
     return adjusted, notification_rect
+
+
+def _summary_waits_for_video(summary: AnalysisSummary) -> bool:
+    problem = short_problem(summary).lower()
+    payload_text = _payload_text(summary.payload).lower()
+    text = f"{problem} {payload_text}"
+    wait_markers = (
+        "нет видео",
+        "пустая аудитория",
+        "нет преподавателя",
+        "камера выключена",
+        "окно не найдено",
+        "черный экран",
+        "чёрный экран",
+        "преподаватель отсутствует",
+        "рабочее место без преподавателя",
+    )
+    return any(marker in text for marker in wait_markers)
+
+
+def _payload_text(value: object) -> str:
+    if isinstance(value, dict):
+        return " ".join(f"{key} {_payload_text(item)}" for key, item in value.items())
+    if isinstance(value, list):
+        return " ".join(_payload_text(item) for item in value)
+    return str(value)

@@ -21,6 +21,10 @@ class VkAuthWindow(QMainWindow):
         super().__init__(parent)
         self.bot_url = bot_url
         self._automation_requested = False
+        self._today_clicks = 0
+        self._today_click_in_flight = False
+        self._today_requested = False
+        self._today_retries_scheduled = False
         self.setWindowTitle("VK авторизация | V505_Control")
         self.setWindowIcon(app_icon())
         self.resize(1120, 780)
@@ -56,9 +60,13 @@ class VkAuthWindow(QMainWindow):
 
     def request_today_schedule(self) -> None:
         self._automation_requested = True
+        self._today_clicks = 0
+        self._today_click_in_flight = False
+        self._today_requested = False
+        self._today_retries_scheduled = False
         self.open_bot()
         self.automation_log.emit("VK: запрашиваю онлайн трансляции на сегодня.")
-        for delay in (1500, 3500, 6000, 9000, 13_000, 18_000, 24_000, 32_000, 45_000):
+        for delay in (7500, 17_500, 30_000, 45_000, 65_000):
             QTimer.singleShot(delay, self._run_schedule_automation)
         self._schedule_page_reads()
 
@@ -87,7 +95,7 @@ class VkAuthWindow(QMainWindow):
 """
         self.web.page().runJavaScript(auth_script, self._emit_page_auth)
         self.web.page().runJavaScript("document.body ? document.body.innerText : ''", self._emit_page_text)
-        if self._automation_requested:
+        if self._automation_requested and not self._today_requested:
             self._run_schedule_automation()
 
     def _emit_page_auth(self, authorized: object) -> None:
@@ -99,7 +107,7 @@ class VkAuthWindow(QMainWindow):
             self.page_text_ready.emit(text)
 
     def _run_schedule_automation(self) -> None:
-        if not self._automation_requested:
+        if not self._automation_requested or self._today_requested or self._today_clicks >= 2:
             return
         script = """
 (() => {
@@ -194,30 +202,39 @@ class VkAuthWindow(QMainWindow):
             self._schedule_page_reads()
         elif status == "clicked-online":
             self.automation_log.emit(f"VK: нажата кнопка {action}.")
-            for delay in (700, 1500, 2500, 4000, 6000, 9000, 13_000):
-                QTimer.singleShot(delay, self._click_today_button)
+            self._schedule_today_retries()
         elif status == "clicked-today":
+            self._today_requested = True
+            self._today_clicks += 1
             self.automation_log.emit("VK: нажата кнопка Сегодня.")
             self._schedule_page_reads()
         elif status == "clicked-menu":
             self.automation_log.emit("VK: перехожу в главное меню.")
-            for delay in (1500, 3500, 6000):
+            for delay in (7500, 17_500, 30_000):
                 QTimer.singleShot(delay, self._run_schedule_automation)
         elif status == "typed-command":
             self.automation_log.emit("VK: команда отправлена текстом.")
-            for delay in (2500, 5000, 8000, 12_000, 18_000):
-                QTimer.singleShot(delay, self._click_today_button)
+            self._schedule_today_retries()
         elif status == "typed-menu":
             self.automation_log.emit("VK: команда Главное меню отправлена текстом.")
-            for delay in (2500, 5000, 8000):
+            for delay in (12_500, 25_000, 40_000):
                 QTimer.singleShot(delay, self._run_schedule_automation)
         elif status == "period-waiting":
-            for delay in (700, 1500, 2500, 4000, 7000, 10_000):
-                QTimer.singleShot(delay, self._click_today_button)
+            self._schedule_today_retries()
+
+    def _schedule_today_retries(self) -> None:
+        if self._today_retries_scheduled or self._today_requested:
+            return
+        self._today_retries_scheduled = True
+        for delay in (4500, 13_000):
+            QTimer.singleShot(delay, self._click_today_button)
 
     def _click_today_button(self) -> None:
-        if not self._automation_requested:
+        if not self._automation_requested or self._today_requested:
             return
+        if self._today_click_in_flight or self._today_clicks >= 2:
+            return
+        self._today_click_in_flight = True
         script = """
 (() => {
   const norm = (value) => (value || '').replace(/\\s+/g, ' ').trim();
@@ -257,10 +274,14 @@ class VkAuthWindow(QMainWindow):
         self.web.page().runJavaScript(script, self._handle_today_click)
 
     def _handle_today_click(self, clicked: object) -> None:
+        self._today_click_in_flight = False
         if clicked == "ready":
+            self._today_requested = True
             self.automation_log.emit("VK: расписание на сегодня уже открыто.")
             self._schedule_page_reads()
         elif bool(clicked):
+            self._today_clicks += 1
+            self._today_requested = True
             self.automation_log.emit("VK: выбран период Сегодня.")
             self._schedule_page_reads()
 

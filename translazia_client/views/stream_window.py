@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Callable
+import time
 
 from PySide6.QtCore import QEvent, Qt, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QCloseEvent, QKeyEvent, QResizeEvent
@@ -24,6 +25,7 @@ class StreamWindow(QMainWindow):
     focus_mode_exited = Signal()
     next_stream_requested = Signal(str)
     previous_stream_requested = Signal(str)
+    multiwindow_requested = Signal()
 
     def __init__(
         self,
@@ -40,13 +42,17 @@ class StreamWindow(QMainWindow):
         self.bridge = bridge
         self.capture: StreamCaptureSession | None = None
         self._join_clicked = False
+        self._join_clicked_at = 0.0
         self._in_call = False
         self._page_loaded = False
+        self._last_recovery_at = 0.0
         self._focus_mode_active = False
         self._closing = False
         self._closed_emitted = False
         self._audio_muted = False
         self._pending_timers: list[QTimer] = []
+        self.recovery_timer = QTimer(self)
+        self.recovery_timer.timeout.connect(self._inspect_call_state)
         self.analysis_timer = QTimer(self)
         self.analysis_timer.timeout.connect(self.start_capture)
         self.setWindowTitle(f"Трансляция {stream.room}")
@@ -54,6 +60,7 @@ class StreamWindow(QMainWindow):
         self._build_ui()
         self._configure_web_engine()
         self.view.setUrl(QUrl(stream.url))
+        self.recovery_timer.start(6500)
         self._start_analysis_timer()
 
     def _build_ui(self) -> None:
@@ -65,7 +72,12 @@ class StreamWindow(QMainWindow):
         self.view = QWebEngineView()
         self.view.setPage(QWebEnginePage(vk_web_profile(), self.view))
         layout.addWidget(self.view, 1)
-        self.mute_button = QPushButton(root)
+        self.room_badge = QPushButton(self.stream.room, self)
+        self.room_badge.setObjectName("streamRoomBadge")
+        self.room_badge.setFixedSize(92, 32)
+        self.room_badge.setEnabled(False)
+        self.room_badge.setToolTip("Текущая аудитория")
+        self.mute_button = QPushButton(self)
         self.mute_button.setObjectName("streamMuteButton")
         self.mute_button.setFixedSize(92, 32)
         self.mute_button.clicked.connect(self.toggle_audio_muted)
@@ -85,8 +97,97 @@ class StreamWindow(QMainWindow):
             """
         )
         self._update_mute_button()
+        self.room_badge.raise_()
         self.mute_button.raise_()
+        self.prev_button = QPushButton("‹", self)
+        self.prev_button.setObjectName("streamNavButton")
+        self.prev_button.setFixedSize(42, 72)
+        self.prev_button.setToolTip("Предыдущая аудитория")
+        self.prev_button.clicked.connect(lambda: self.previous_stream_requested.emit(self.stream.room))
+        self.prev_button.hide()
+
+        self.next_button = QPushButton("›", self)
+        self.next_button.setObjectName("streamNavButton")
+        self.next_button.setFixedSize(42, 72)
+        self.next_button.setToolTip("Следующая аудитория")
+        self.next_button.clicked.connect(lambda: self.next_stream_requested.emit(self.stream.room))
+        self.next_button.hide()
+
+        self.close_stream_button = QPushButton("Закрыть", self)
+        self.close_stream_button.setObjectName("streamCloseButton")
+        self.close_stream_button.setFixedSize(104, 34)
+        self.close_stream_button.setToolTip("Закрыть эту трансляцию")
+        self.close_stream_button.clicked.connect(self.close)
+        self.close_stream_button.hide()
+
+        self.multiwindow_button = QPushButton("Многооконность", self)
+        self.multiwindow_button.setObjectName("streamMultiwindowButton")
+        self.multiwindow_button.setFixedSize(136, 34)
+        self.multiwindow_button.setToolTip("Вернуться к виду всех трансляций")
+        self.multiwindow_button.clicked.connect(self.multiwindow_requested.emit)
+        self.multiwindow_button.hide()
+
+        self.setStyleSheet(
+            self.styleSheet()
+            + """
+            QPushButton#streamRoomBadge {
+                background: rgba(255, 255, 255, 232);
+                color: #00328a;
+                border: 1px solid rgba(0, 76, 190, 180);
+                border-radius: 8px;
+                font-weight: 800;
+            }
+            QPushButton#streamRoomBadge:disabled {
+                color: #00328a;
+            }
+            QPushButton#streamNavButton {
+                background: rgba(255, 255, 255, 220);
+                color: #00328a;
+                border: 1px solid rgba(0, 76, 190, 170);
+                border-radius: 10px;
+                font-size: 34px;
+                font-weight: 800;
+            }
+            QPushButton#streamNavButton:hover {
+                background: #ffffff;
+                border-color: #006dff;
+            }
+            QPushButton#streamCloseButton {
+                background: rgba(255, 255, 255, 232);
+                color: #9a1b1b;
+                border: 1px solid rgba(190, 0, 0, 150);
+                border-radius: 8px;
+                font-weight: 800;
+            }
+            QPushButton#streamCloseButton:hover {
+                background: #fff3f3;
+                border-color: #d52828;
+            }
+            QPushButton#streamMultiwindowButton {
+                background: rgba(255, 255, 255, 232);
+                color: #00328a;
+                border: 1px solid rgba(0, 76, 190, 170);
+                border-radius: 8px;
+                font-weight: 800;
+            }
+            QPushButton#streamMultiwindowButton:hover {
+                background: #ffffff;
+                border-color: #006dff;
+            }
+            """
+        )
         self.setCentralWidget(root)
+
+    def set_focus_controls_visible(self, visible: bool) -> None:
+        for button in (self.prev_button, self.next_button, self.close_stream_button, self.multiwindow_button):
+            button.setVisible(visible)
+            if visible:
+                button.raise_()
+        QTimer.singleShot(0, self._position_overlay_buttons)
+
+    def set_focus_mode_active(self, active: bool) -> None:
+        self._focus_mode_active = active
+        self.set_focus_controls_visible(active)
 
     def _configure_web_engine(self) -> None:
         settings = self.view.settings()
@@ -146,11 +247,25 @@ class StreamWindow(QMainWindow):
         if self._closing or self._in_call:
             return
         self._join_clicked = False
+        self._join_clicked_at = 0.0
         self._page_loaded = False
         try:
-            self.view.reload()
+            self.view.setUrl(QUrl(self.stream.url))
         except RuntimeError:
             self._closing = True
+
+    def _recover_call_page(self, reason: str) -> None:
+        if self._closing:
+            return
+        now = time.monotonic()
+        if now - self._last_recovery_at < 12:
+            return
+        self._last_recovery_at = now
+        self._in_call = False
+        self._join_clicked = False
+        self._join_clicked_at = 0.0
+        self.launch_state_changed.emit(self.stream.room, reason)
+        self.reload_and_retry_join()
 
     def _schedule_once(self, delay_ms: int, callback: Callable[[], None]) -> None:
         timer = QTimer(self)
@@ -212,14 +327,68 @@ class StreamWindow(QMainWindow):
             return
         if result.get("inCall"):
             self._in_call = True
+            self._join_clicked = False
+            self._join_clicked_at = 0.0
             self.setWindowTitle(f"Трансляция {self.stream.room} - открыто")
             self.launch_state_changed.emit(self.stream.room, "connected")
             return
         if result.get("clicked"):
             self._join_clicked = True
+            self._join_clicked_at = time.monotonic()
             self.setWindowTitle(f"Трансляция {self.stream.room} - подключение")
             self.launch_state_changed.emit(self.stream.room, "join_clicked")
             self._schedule_once(3500, self._try_join_call)
+
+    def _inspect_call_state(self) -> None:
+        if self._closing or not self._page_loaded:
+            return
+        script = """
+(() => {
+  const norm = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+  const text = document.body ? document.body.innerText : '';
+  const buttons = Array.from(document.querySelectorAll('button, [role="button"], a, .vkuiButton, .Button, [tabindex], div, span'));
+  const hasJoinButton = buttons.some((button) => {
+    const label = norm(button.innerText || button.textContent || button.getAttribute('aria-label'));
+    if (!label || label.length > 80) return false;
+    return /^(Присоединиться|Войти|Join|Continue|Продолжить)$/i.test(label);
+  });
+  const hasCallError =
+    /Не удалось позвонить/i.test(text) ||
+    /произошла ошибка[^\\n]{0,120}попробуйте/i.test(text) ||
+    /попробуйте еще раз/i.test(text);
+  const inCall =
+    /Во время звонка/i.test(text) ||
+    /Включите камеру/i.test(text) ||
+    /Выключить микрофон|Включить микрофон/i.test(text) ||
+    /Покинуть звонок/i.test(text) ||
+    ((/В звонке\\s+\\d+\\s+участник/i.test(text) || /В звонке пока никого нет/i.test(text)) && !hasJoinButton);
+  return {hasCallError, inCall, hasJoinButton};
+})()
+"""
+        try:
+            self.view.page().runJavaScript(script, self._on_call_state_inspected)
+        except RuntimeError:
+            self._closing = True
+
+    def _on_call_state_inspected(self, result: object) -> None:
+        if self._closing or not isinstance(result, dict):
+            return
+        if result.get("inCall"):
+            if not self._in_call:
+                self._in_call = True
+                self._join_clicked = False
+                self._join_clicked_at = 0.0
+                self.setWindowTitle(f"Трансляция {self.stream.room} - открыто")
+                self.launch_state_changed.emit(self.stream.room, "connected")
+            return
+        if result.get("hasCallError"):
+            self._recover_call_page("call_error_reloaded")
+            return
+        if result.get("hasJoinButton"):
+            self._try_join_call()
+            return
+        if self._join_clicked and self._join_clicked_at and time.monotonic() - self._join_clicked_at > 18:
+            self._recover_call_page("join_timeout_reloaded")
 
     def launch_state(self) -> str:
         if self._in_call:
@@ -241,7 +410,7 @@ class StreamWindow(QMainWindow):
     def _start_analysis_timer(self) -> None:
         if not self.settings.analysis.enabled:
             return
-        delay_ms = 12_000
+        delay_ms = 10_000
         interval_ms = max(60_000, int(self.settings.analysis.interval_minutes) * 60_000)
         self._schedule_once(delay_ms, self.start_capture)
         self.analysis_timer.start(interval_ms)
@@ -291,13 +460,37 @@ class StreamWindow(QMainWindow):
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
-        if hasattr(self, "mute_button") and self.centralWidget() is not None:
-            margin = 10
-            self.mute_button.move(
-                max(margin, self.centralWidget().width() - self.mute_button.width() - margin),
+        self._position_overlay_buttons()
+
+    def _position_overlay_buttons(self) -> None:
+        if not hasattr(self, "mute_button"):
+            return
+        margin = 12
+        width = max(1, self.width())
+        height = max(1, self.height())
+        close_visible = getattr(self, "close_stream_button", None) is not None and self.close_stream_button.isVisible()
+        if close_visible:
+            self.close_stream_button.move(max(margin, width - self.close_stream_button.width() - margin), margin)
+            self.multiwindow_button.move(
+                max(margin, self.close_stream_button.x() - self.multiwindow_button.width() - margin),
                 margin,
             )
-            self.mute_button.raise_()
+            mute_x = self.multiwindow_button.x() - self.mute_button.width() - margin
+            self.mute_button.move(max(margin, mute_x), margin)
+            room_x = self.mute_button.x() - self.room_badge.width() - margin
+            self.room_badge.move(max(margin, room_x), margin)
+            self.prev_button.move(margin, max(margin, (height - self.prev_button.height()) // 2))
+            self.next_button.move(max(margin, width - self.next_button.width() - margin), max(margin, (height - self.next_button.height()) // 2))
+            self.prev_button.raise_()
+            self.next_button.raise_()
+            self.multiwindow_button.raise_()
+            self.close_stream_button.raise_()
+        else:
+            self.mute_button.move(max(margin, width - self.mute_button.width() - margin), margin)
+            room_x = self.mute_button.x() - self.room_badge.width() - margin
+            self.room_badge.move(max(margin, room_x), margin)
+        self.room_badge.raise_()
+        self.mute_button.raise_()
 
     def changeEvent(self, event: QEvent) -> None:
         super().changeEvent(event)
@@ -306,7 +499,7 @@ class StreamWindow(QMainWindow):
         if self.isMaximized():
             self._focus_mode_active = True
             self.focus_mode_requested.emit(self.stream.room)
-        elif self._focus_mode_active and not self.isMinimized():
+        elif self._focus_mode_active and not self.isMaximized():
             self._focus_mode_active = False
             self.focus_mode_exited.emit()
 

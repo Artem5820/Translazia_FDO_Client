@@ -337,10 +337,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, title, message)
 
     def show_tray_message(self, title: str, message: str, warning: bool = False) -> None:
-        if not self.tray.isVisible():
-            return
-        icon = QSystemTrayIcon.MessageIcon.Warning if warning else QSystemTrayIcon.MessageIcon.Information
-        self.tray.showMessage(title, message, icon, 9000)
+        return
 
     @Slot()
     def bring_to_front(self) -> None:
