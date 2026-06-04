@@ -1,101 +1,162 @@
-# SoundChecker audio module
+# VK Video Analyzer
 
-Модуль анализирует аудиодорожку трансляции и выводит JSON для сервера/клиента модератора. Сейчас это CLI-прототип: на вход можно передать аудио или видеофайл с аудиопотоком.
+Инструмент для анализа записей видеоуроков и VK-трансляций.  
+Модуль проходит по видео, определяет состояние трансляции и сохраняет результат в JSON или JSONL для дальнейшей обработки в сервисе или интерфейсе.
 
-## Что проверяется
+## Для чего нужен
 
-- доля тишины;
-- наличие речи через Silero VAD, если пакет доступен;
-- общий уровень громкости;
-- клиппинг/перегруз;
-- грубая оценка отношения полезного сигнала к шуму;
-- спектральные признаки: энергия в речевой полосе, низкочастотный гул, высокочастотный шум, доминирующий тон.
+Проект помогает автоматически находить проблемные участки в записи, например:
+
+- преподаватель пропал из кадра
+- вместо видео долго показывается аватар
+- идёт демонстрация экрана
+- в кадре пустая аудитория или рабочее место
+- экран стал чёрным
+- кадр завис
+- качество изображения слишком низкое
+
+На выходе можно получить как компактный список проблем, так и подробную структуру с сегментами, событиями и покадровыми наблюдениями.
+
+## Что внутри
+
+```text
+vk_video_analyzer/        основной модуль анализатора
+models/                   локальные веса layout-модели
+requirements.txt          зависимости проекта
+README.md                 описание проекта
+```
+
+## Стек
+
+- Python
+- OpenCV
+- NumPy
+- Ultralytics YOLO
 
 ## Установка
 
-Требуется Python 3.10+ и `ffmpeg` в `PATH`. Базовая версия работает только с `numpy`; Silero VAD подключается опционально.
-
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+.\.venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Опционально для готовой VAD-модели:
+## Подготовка моделей
+
+По умолчанию проект использует локальные веса:
+
+- `yolo11n.pt` в корне проекта
+- `models/vk_layout_best.pt` внутри папки `models`
+
+Если эти файлы лежат в других местах, их можно передать через аргументы CLI.
+
+## Быстрый запуск
 
 ```powershell
-pip install -r requirements-vad.txt
+python -m vk_video_analyzer.cli `
+  --video "C:\videos\lecture.mp4" `
+  --output "C:\videos\lecture_alert.json"
 ```
 
-Если установка Silero/Torch не проходит на Python 3.13, используйте Python 3.10 или 3.11. Без Silero модуль все равно выводит JSON, но `speech_ratio` считается энергетическим fallback-методом.
+## Форматы результата
 
-## Запуск
+- `alerts` - компактный JSON только с проблемами
+- `full` - полный JSON с наблюдениями и сегментами
+- `events` - итоговые события по найденным проблемам
+- `live-events` - потоковый JSONL во время анализа
+
+Пример сохранения событий:
 
 ```powershell
-python -m soundchecker .\sample.mp4
+python -m vk_video_analyzer.cli `
+  --video "C:\videos\lecture.mp4" `
+  --output "C:\videos\lecture_events.json" `
+  --format events
 ```
 
-С сохранением спектрограммы:
+Пример потокового вывода:
 
 ```powershell
-python -m soundchecker .\sample.mp4 --spectrogram .\sample_spectrogram.png
+python -m vk_video_analyzer.cli `
+  --video "C:\videos\lecture.mp4" `
+  --output "C:\videos\lecture_live.jsonl" `
+  --format live-events
 ```
 
-Пример JSON:
+## Основные аргументы CLI
 
-```json
-{
-  "status": "critical",
-  "issues": [
-    {
-      "code": "mostly_silence",
-      "severity": "critical",
-      "message": "Audio is mostly silent"
-    }
-  ],
-  "metrics": {
-    "duration_sec": 30.0,
-    "sample_rate_hz": 16000,
-    "rms_dbfs": -48.2,
-    "peak_dbfs": -20.1,
-    "silence_ratio": 0.91,
-    "speech_ratio": 0.01,
-    "clipping_ratio": 0.0,
-    "noise_floor_dbfs": -72.3,
-    "active_level_dbfs": -36.1,
-    "snr_estimate_db": 36.2,
-    "vad_backend": "silero_vad",
-    "spectral": {
-      "centroid_hz": 850.0,
-      "bandwidth_hz": 1200.0,
-      "low_freq_ratio": 0.12,
-      "speech_band_ratio": 0.72,
-      "high_freq_ratio": 0.04,
-      "hum_ratio": 0.01,
-      "tone_dominance_ratio": 0.08,
-      "spectral_flatness": 0.11
-    }
-  }
-}
+- `--video` - путь к видеофайлу
+- `--output` - путь к итоговому JSON или JSONL
+- `--sample-interval` - шаг анализа в секундах
+- `--device` - устройство для YOLO, например `cpu` или `0`
+- `--person-conf` - порог уверенности для детекции человека
+- `--person-weights` - список весов для person-модели
+- `--layout-weights` - путь к layout-модели
+- `--mute-templates-dir` - папка с PNG-шаблонами mute-иконки
+- `--format` - формат результата
+- `--only-on-problem` - не сохранять файл, если проблем не найдено
+- `--no-observations` - не включать покадровые наблюдения в полный JSON
+
+Пример с явным указанием весов:
+
+```powershell
+python -m vk_video_analyzer.cli `
+  --video "C:\videos\lecture.mp4" `
+  --output "C:\videos\lecture_alert.json" `
+  --person-weights "C:\models\yolo11n.pt" `
+  --layout-weights "C:\models\vk_layout_best.pt"
 ```
 
-Спектральные предупреждения:
+## Использование как Python-модуля
 
-- `power_hum`: выраженный гул около 50/60 Гц и гармоник;
-- `high_frequency_noise`: слишком много энергии в верхних частотах, похоже на шипение;
-- `muffled_or_filtered_audio`: мало энергии в речевой полосе 300-3400 Гц;
-- `tonal_signal`: стабильный тон вместо речи.
+```python
+from vk_video_analyzer import AnalyzerConfig, VideoAnalyzer
 
-## Датасеты для следующего этапа
+analyzer = VideoAnalyzer(AnalyzerConfig())
+result = analyzer.analyze(r"C:\videos\lecture.mp4")
+payload = result.to_dict(output_format="alerts")
+```
 
-Для первой версии свой датасет не обязателен: лучше начать с готового VAD и накопления реальных фрагментов из тестовых трансляций с ручной разметкой проблем. Когда понадобится обучение/валидация, полезны:
+Сохранение результата сразу в файл:
 
-- AudioSet: общая разметка звуковых событий;
-- MUSAN: речь, музыка и шумы для аугментации;
-- DNS Challenge: шумная речь и шумы для задач шумоподавления/оценки качества;
-- Common Voice Russian и Golos: русская речь;
-- LibriSpeech: чистая английская речь для базовых проверок пайплайна.
+```python
+from vk_video_analyzer import AnalyzerConfig, VideoAnalyzer
 
-## Интеграция
+analyzer = VideoAnalyzer(AnalyzerConfig())
+analyzer.analyze_to_json(
+    video_path=r"C:\videos\lecture.mp4",
+    output_path=r"C:\videos\lecture_alert.json",
+    output_format="alerts",
+)
+```
 
-Сервер может вызывать модуль как процесс и читать stdout. Позже тот же анализатор можно обернуть в HTTP/gRPC без изменения ядра `soundchecker.analyzer`.
+## Что исключено из Git
+
+В `.gitignore` уже добавлены:
+
+- виртуальное окружение
+- `__pycache__`
+- служебные папки IDE
+- временные и выходные файлы
+- видеофайлы
+- локальные веса моделей `.pt`
+
+Это позволит выгружать в Git только код и документацию, без тяжёлых бинарников и мусора.
+
+## Первая загрузка в Git
+
+Если репозиторий ещё не инициализирован локально:
+
+```powershell
+git init
+git add .
+git commit -m "Initial commit"
+```
+
+Дальше можно привязать удалённый репозиторий и отправить код:
+
+```powershell
+git remote add origin <URL_РЕПОЗИТОРИЯ>
+git branch -M main
+git push -u origin main
+```
