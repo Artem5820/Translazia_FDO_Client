@@ -7,7 +7,7 @@ from tempfile import TemporaryDirectory
 
 from translazia_client.analysis import AnalysisSummary, combine_analysis_summaries, summarize_audio_payload
 from translazia_client.layout import ScreenRect, compute_window_placements
-from translazia_client.controllers.main_controller import _recording_time_is_valid, _recording_title, _screens_with_notification_strip
+from translazia_client.controllers.main_controller import MainController, _recording_time_is_valid, _recording_title, _screens_with_notification_strip, _vk_text_says_no_classes
 from translazia_client.resources import APP_ICON_PATH, LOGO_PATH
 from translazia_client.config import SourceSettings
 from translazia_client.services.results_cleanup import cleanup_results_folder
@@ -41,9 +41,9 @@ https://vk.com/call/join/abc
         placements = compute_window_placements(screens, 13)
         self.assertEqual(len(placements), 13)
 
-    def test_notification_strip_width_is_240(self) -> None:
+    def test_notification_strip_width_is_280(self) -> None:
         _, notification = _screens_with_notification_strip()
-        self.assertEqual(notification.width, 240)
+        self.assertEqual(notification.width, 280)
 
     def test_recording_title_uses_room_and_current_date_format(self) -> None:
         self.assertEqual(_recording_title("В-505", "03_06_2026"), "В505 03_06_2026")
@@ -52,6 +52,30 @@ https://vk.com/call/join/abc
         now = datetime(2026, 6, 3, 17, 55, 1)
         self.assertFalse(_recording_time_is_valid(17, 55, now))
         self.assertTrue(_recording_time_is_valid(17, 56, now))
+
+    def test_vk_no_classes_message_is_detected(self) -> None:
+        self.assertTrue(_vk_text_says_no_classes("V505_Control\nОнлайн занятий в выбранном периоде нет."))
+
+    def test_vk_no_classes_message_stops_active_request(self) -> None:
+        class FakeVkWindow:
+            def __init__(self) -> None:
+                self.stopped = False
+
+            def stop_schedule_request(self) -> None:
+                self.stopped = True
+
+        vk_window = FakeVkWindow()
+        controller = MainController.__new__(MainController)
+        controller._vk_schedule_request_active = True
+        controller.vk_auth_window = vk_window
+        messages: list[str] = []
+        controller._show_no_classes = messages.append  # type: ignore[method-assign]
+
+        controller._on_vk_page_text_ready("V505_Control\nОнлайн занятий в выбранном периоде нет.")
+
+        self.assertFalse(controller._vk_schedule_request_active)
+        self.assertTrue(vk_window.stopped)
+        self.assertEqual(messages, ["VK: бот ответил, что онлайн занятий нет."])
 
     def test_seed_file_has_twelve_rooms(self) -> None:
         streams = load_streams_from_file("data/streams_seed.txt")

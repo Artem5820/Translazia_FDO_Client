@@ -35,6 +35,7 @@ from ..resources import LOGO_SMALL_PATH, app_icon
 class MainWindow(QMainWindow):
     refresh_requested = Signal()
     launch_requested = Signal()
+    manual_streams_requested = Signal()
     settings_requested = Signal()
     notifications_requested = Signal()
     vk_login_requested = Signal()
@@ -125,11 +126,14 @@ class MainWindow(QMainWindow):
         clear_all_btn.clicked.connect(self.clear_stream_selection)
         invert_btn = QPushButton("Инвертировать")
         invert_btn.clicked.connect(self.invert_stream_selection)
+        self.manual_streams_btn = QPushButton("Ручной режим")
+        self.manual_streams_btn.clicked.connect(self.manual_streams_requested.emit)
         selection_bar.addWidget(self.selected_count_label)
         selection_bar.addStretch(1)
         selection_bar.addWidget(select_all_btn)
         selection_bar.addWidget(clear_all_btn)
         selection_bar.addWidget(invert_btn)
+        selection_bar.addWidget(self.manual_streams_btn)
         left_layout.addLayout(selection_bar)
 
         self.stream_table = QTableWidget(0, 5)
@@ -229,6 +233,18 @@ class MainWindow(QMainWindow):
         self.stream_table.blockSignals(True)
         self.streams = streams
         self.stream_table.setRowCount(0)
+        self.stream_table.clearSpans()
+        if not self.streams:
+            self.stream_table.insertRow(0)
+            item = QTableWidgetItem("Занятий нет")
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.stream_table.setItem(0, 0, item)
+            self.stream_table.setSpan(0, 0, 1, self.stream_table.columnCount())
+            self._update_empty_stream_row_height()
+            self.stream_table.blockSignals(False)
+            self.update_selected_count()
+            return
         for stream in self.streams:
             row = self.stream_table.rowCount()
             self.stream_table.insertRow(row)
@@ -282,6 +298,16 @@ class MainWindow(QMainWindow):
             if item is not None:
                 item.setCheckState(state)
         self.update_selected_count()
+
+    def _update_empty_stream_row_height(self) -> None:
+        if self.streams or self.stream_table.rowCount() != 1:
+            return
+        height = max(220, self.stream_table.viewport().height() - 8)
+        self.stream_table.setRowHeight(0, height)
+
+    def resizeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        super().resizeEvent(event)
+        self._update_empty_stream_row_height()
 
     def add_analysis_row(self, room: str, path: str, summary: AnalysisSummary | None, error: str) -> None:
         row = self.analysis_table.rowCount()

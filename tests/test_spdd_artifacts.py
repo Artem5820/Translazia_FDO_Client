@@ -18,12 +18,16 @@ class SpddArtifactsTests(unittest.TestCase):
             "test-scenarios.md",
             "verification.md",
             "conclusion.md",
+            "prompts/README.md",
             "prompts/001-initial-client.md",
             "prompts/002-mvc-blueprint-notifications.md",
             "prompts/003-spdd-compliance.md",
             "prompts/004-operational-hardening.md",
             "prompts/005-operator-workflow-polish.md",
             "prompts/006-fdo-branding-refresh.md",
+            "prompts/007-vk-web-authorization.md",
+            "prompts/008-recording-semi-automatic-and-exe-build.md",
+            "prompts/009-lab8-final-report.md",
         ]
         for relative_path in required:
             with self.subTest(relative_path=relative_path):

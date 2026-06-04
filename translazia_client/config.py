@@ -4,9 +4,10 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
 from typing import Any, TypeVar
 import json
+import sys
 
 
-APP_DIR = Path(__file__).resolve().parents[1]
+APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[1]
 DATA_DIR = APP_DIR / "data"
 CONFIG_PATH = DATA_DIR / "settings.json"
 

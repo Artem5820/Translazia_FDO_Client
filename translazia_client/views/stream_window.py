@@ -6,7 +6,7 @@ import time
 
 from PySide6.QtCore import QEvent, Qt, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QCloseEvent, QKeyEvent, QResizeEvent
-from PySide6.QtWidgets import QMainWindow, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QLabel, QMainWindow, QPushButton, QVBoxLayout, QWidget
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
@@ -51,6 +51,7 @@ class StreamWindow(QMainWindow):
         self._closing = False
         self._closed_emitted = False
         self._audio_muted = False
+        self._recording_assistant_id = 0
         self._pending_timers: list[QTimer] = []
         self.recovery_timer = QTimer(self)
         self.recovery_timer.timeout.connect(self._inspect_call_state)
@@ -106,6 +107,13 @@ class StreamWindow(QMainWindow):
         self.room_badge.raise_()
         self.mute_button.raise_()
         self.refresh_button.raise_()
+        if hasattr(self, "recording_hint"):
+            hint_width = min(max(360, width - 48), 620)
+            self.recording_hint.setFixedWidth(hint_width)
+            self.recording_hint.adjustSize()
+            self.recording_hint.move(max(margin, (width - self.recording_hint.width()) // 2), 54)
+            if self.recording_hint.isVisible():
+                self.recording_hint.raise_()
         self.prev_button = QPushButton("‹", self)
         self.prev_button.setObjectName("streamNavButton")
         self.prev_button.setFixedSize(42, 72)
@@ -133,6 +141,15 @@ class StreamWindow(QMainWindow):
         self.multiwindow_button.setToolTip("Вернуться к виду всех трансляций")
         self.multiwindow_button.clicked.connect(self.multiwindow_requested.emit)
         self.multiwindow_button.hide()
+
+        self.recording_hint = QLabel(
+            "Откройте в VK: шестерёнка → Записать звонок. Название заполнится автоматически.",
+            self,
+        )
+        self.recording_hint.setObjectName("streamRecordingHint")
+        self.recording_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.recording_hint.setWordWrap(True)
+        self.recording_hint.hide()
 
         self.setStyleSheet(
             self.styleSheet()
@@ -193,6 +210,14 @@ class StreamWindow(QMainWindow):
             QPushButton#streamMultiwindowButton:hover {
                 background: #ffffff;
                 border-color: #006dff;
+            }
+            QLabel#streamRecordingHint {
+                background: rgba(255, 255, 255, 238);
+                color: #0635b8;
+                border: 1px solid rgba(0, 76, 190, 180);
+                border-radius: 8px;
+                padding: 8px 12px;
+                font-weight: 800;
             }
             """
         )
@@ -436,12 +461,64 @@ class StreamWindow(QMainWindow):
         if self._closing:
             callback({"state": "closed", "recording": False})
             return
+        if self.isMinimized() or not self.isVisible():
+            callback({"state": "window_not_visible", "recording": False})
+            return
+        self._recording_assistant_id += 1
+        assistant_id = self._recording_assistant_id
+        self._show_recording_hint()
         script = _START_RECORDING_SCRIPT.replace("__RECORDING_TITLE__", json.dumps(title, ensure_ascii=False))
+        self._run_recording_assistant(script, callback, assistant_id, time.monotonic())
+
+    def _run_recording_assistant(
+        self,
+        script: str,
+        callback: Callable[[dict[str, object]], None],
+        assistant_id: int,
+        started_at: float,
+    ) -> None:
+        if assistant_id != self._recording_assistant_id:
+            return
+        if self._closing:
+            callback({"state": "closed", "recording": False})
+            return
         try:
-            self.view.page().runJavaScript(script, lambda result: callback(_recording_result(result)))
+            self.view.page().runJavaScript(
+                script,
+                lambda result: self._on_recording_assistant_result(script, callback, assistant_id, started_at, result),
+            )
         except RuntimeError:
             self._closing = True
+            self._hide_recording_hint()
             callback({"state": "closed", "recording": False})
+
+    def _on_recording_assistant_result(
+        self,
+        script: str,
+        callback: Callable[[dict[str, object]], None],
+        assistant_id: int,
+        started_at: float,
+        result: object,
+    ) -> None:
+        if self._closing or assistant_id != self._recording_assistant_id:
+            return
+        payload = _recording_result(result)
+        state = str(payload.get("state", "unknown"))
+        if state == "waiting_record_dialog" and time.monotonic() - started_at < 45:
+            QTimer.singleShot(1000, lambda: self._run_recording_assistant(script, callback, assistant_id, started_at))
+            return
+        if state == "waiting_record_dialog":
+            payload = {**payload, "state": "record_dialog_timeout"}
+        self._hide_recording_hint()
+        callback(payload)
+
+    def _show_recording_hint(self) -> None:
+        self.recording_hint.show()
+        self._position_overlay_buttons()
+
+    def _hide_recording_hint(self) -> None:
+        if hasattr(self, "recording_hint"):
+            self.recording_hint.hide()
 
     def inspect_recording_state(self, callback: Callable[[dict[str, object]], None]) -> None:
         if self._closing:
@@ -610,7 +687,7 @@ class StreamWindow(QMainWindow):
 def _recording_result(result: object) -> dict[str, object]:
     if isinstance(result, dict):
         return result
-    return {"state": "command_started", "recording": False}
+    return {"state": "no_result", "recording": False}
 
 
 _INSPECT_RECORDING_SCRIPT = """
@@ -637,117 +714,24 @@ _START_RECORDING_SCRIPT = """
     const style = getComputedStyle(node);
     return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
   };
+  const text = () => norm(document.body ? document.body.innerText : '');
   const label = (node) => norm(
     node.innerText ||
     node.textContent ||
     node.getAttribute('aria-label') ||
     node.getAttribute('title') ||
-    node.getAttribute('data-testid') ||
+    node.getAttribute('placeholder') ||
     ''
   );
-  const actionSelector = 'button, [role="button"], a, .vkuiButton, .Button, [tabindex]';
-  const textSelector = `${actionSelector}, div, span`;
-  const actionNode = (node) => node.closest(actionSelector) || node;
-  const clickables = () => Array.from(document.querySelectorAll(actionSelector)).filter(visible);
-  const textNodes = () => Array.from(document.querySelectorAll(textSelector)).filter(visible);
-  const clickNode = (node) => {
-    node = actionNode(node);
-    node.scrollIntoView({block: 'center', inline: 'center'});
-    const rect = node.getBoundingClientRect();
-    const x = rect.left + rect.width / 2;
-    const y = rect.top + rect.height / 2;
-    if (window.PointerEvent) {
-      for (const type of ['pointerdown', 'pointerup']) {
-        node.dispatchEvent(new PointerEvent(type, {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, pointerType: 'mouse'}));
-      }
-    }
-    for (const type of ['mousedown', 'mouseup', 'click']) {
-      node.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y}));
-    }
-    if (typeof node.click === 'function') node.click();
-  };
-  const pageText = () => norm(document.body ? document.body.innerText : '');
   const isRecording = () => {
-    const text = pageText();
+    const pageText = text();
     return (
-      /Ид[её]т запись звонка/i.test(text) ||
-      /\\b\\d{2}:\\d{2}\\s+Завершить\\b/i.test(text) ||
-      /запись звонка[^\\n]{0,100}Завершить/i.test(text)
+      /Ид[её]т запись звонка/i.test(pageText) ||
+      /\\b\\d{2}:\\d{2}\\s+Завершить\\b/i.test(pageText) ||
+      /запись звонка[^\\n]{0,100}Завершить/i.test(pageText)
     );
   };
-  const findByText = (patterns) => {
-    const candidates = textNodes()
-      .map((node) => actionNode(node))
-      .filter((node, index, nodes) => node && visible(node) && nodes.indexOf(node) === index);
-    for (const node of candidates) {
-      const text = label(node);
-      if (!text || text.length > 160) continue;
-      if (patterns.some((pattern) => pattern.test(text))) return node;
-    }
-    return null;
-  };
-  const closeTransientUi = async () => {
-    document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true}));
-    document.dispatchEvent(new KeyboardEvent('keyup', {key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true}));
-    await sleep(250);
-  };
-  const findGear = () => {
-    const named = findByText([/настрой/i, /параметр/i, /settings/i]);
-    if (named) return named;
-    const width = Math.max(1, window.innerWidth || document.documentElement.clientWidth || 1);
-    const height = Math.max(1, window.innerHeight || document.documentElement.clientHeight || 1);
-    const rightBottomIcons = clickables()
-      .map((node) => actionNode(node))
-      .filter((node, index, nodes) => node && nodes.indexOf(node) === index)
-      .filter((node) => {
-        const rect = node.getBoundingClientRect();
-        const text = label(node);
-        if (/заверш|микрофон|камера|демонстрац|поднять руку|чат|ссылка/i.test(text)) return false;
-        return (
-          node.querySelector('svg') &&
-          rect.left > width * 0.62 &&
-          rect.top > height * 0.68 &&
-          rect.width >= 24 &&
-          rect.width <= 90 &&
-          rect.height >= 24 &&
-          rect.height <= 90
-        );
-      })
-      .sort((a, b) => {
-        const ar = a.getBoundingClientRect();
-        const br = b.getBoundingClientRect();
-        return ar.left - br.left;
-      });
-    if (rightBottomIcons.length >= 2) return rightBottomIcons[1];
-    return rightBottomIcons[0] || null;
-  };
-  const findGearCandidates = () => {
-    const named = findByText([/настрой/i, /параметр/i, /settings/i]);
-    const candidates = named ? [named] : [];
-    const width = Math.max(1, window.innerWidth || document.documentElement.clientWidth || 1);
-    const height = Math.max(1, window.innerHeight || document.documentElement.clientHeight || 1);
-    const rightBottom = [];
-    for (const node of clickables()) {
-      const rect = node.getBoundingClientRect();
-      const text = label(node);
-      if (/заверш|микрофон|камера|демонстрац|поднять руку|чат|ссылка/i.test(text)) continue;
-      if (
-        node.querySelector('svg') &&
-        rect.left > width * 0.62 &&
-        rect.top > height * 0.68 &&
-        rect.width >= 24 &&
-        rect.width <= 90 &&
-        rect.height >= 24 &&
-        rect.height <= 90
-      ) {
-        rightBottom.push(actionNode(node));
-      }
-    }
-    rightBottom.sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
-    if (rightBottom.length >= 2) candidates.push(rightBottom[1]);
-    for (const node of rightBottom) candidates.push(node);
-    return candidates.filter((node, index, nodes) => node && nodes.indexOf(node) === index);
-  };
+  const dialogOpen = () => /Создать запись звонка|Название/i.test(text());
   const findTitleField = () => {
     const fields = Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"]')).filter(visible);
     if (!fields.length) return null;
@@ -767,64 +751,42 @@ _START_RECORDING_SCRIPT = """
         Object.getOwnPropertyDescriptor(field.constructor.prototype, 'value')?.set ||
         Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set ||
         Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
-      if (setter) {
-        setter.call(field, value);
-      } else {
-        field.value = value;
-      }
+      if (setter) setter.call(field, value);
+      else field.value = value;
       field.dispatchEvent(new Event('input', {bubbles: true}));
       field.dispatchEvent(new Event('change', {bubbles: true}));
       return;
     }
-    field.textContent = '';
-    field.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'deleteContent'}));
     field.textContent = value;
     field.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: value}));
   };
-
-  if (isRecording()) {
-    return {state: 'already_recording', recording: true, title};
-  }
-
-  let recordAction = findByText([/^Записать звонок$/i, /Записать звонок/i]);
-  if (!recordAction || /Создать запись звонка/i.test(pageText())) {
-    recordAction = null;
-  }
-  if (!recordAction && !/Создать запись звонка|Название/i.test(pageText())) {
-    const gears = findGearCandidates();
-    if (!gears.length) {
-      const gear = findGear();
-      if (gear) gears.push(gear);
+  const findSubmit = () => {
+    const nodes = Array.from(document.querySelectorAll('button, [role="button"], .vkuiButton, .Button, [tabindex]')).filter(visible);
+    return nodes.find((node) => /^Записать звонок$/i.test(label(node)) || /^Создать запись/i.test(label(node))) || null;
+  };
+  const clickNode = (node) => {
+    node.scrollIntoView({block: 'center', inline: 'center'});
+    const rect = node.getBoundingClientRect();
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+    if (window.PointerEvent) {
+      node.dispatchEvent(new PointerEvent('pointerdown', {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, pointerType: 'mouse'}));
+      node.dispatchEvent(new PointerEvent('pointerup', {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, pointerType: 'mouse'}));
     }
-    if (!gears.length) return {state: 'gear_not_found', recording: false, title};
-    for (const gear of gears) {
-      clickNode(gear);
-      await sleep(900);
-      recordAction = findByText([/^Записать звонок$/i, /Записать звонок/i]);
-      if (recordAction) break;
-      await closeTransientUi();
-    }
-  }
-  if (recordAction) {
-    clickNode(recordAction);
-    await sleep(900);
-  }
-  if (!/Создать запись звонка|Название/i.test(pageText())) {
-    await sleep(700);
-  }
-  if (!/Создать запись звонка|Название/i.test(pageText()) && !recordAction) {
-    return {state: 'record_action_not_found', recording: false, title};
-  }
-  if (!/Создать запись звонка|Название/i.test(pageText())) {
-    return {state: 'record_dialog_not_opened', recording: false, title};
-  }
+    node.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y}));
+    node.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y}));
+    node.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y}));
+  };
+
+  if (isRecording()) return {state: 'already_recording', recording: true, title};
+  if (!dialogOpen()) return {state: 'waiting_record_dialog', recording: false, title};
 
   const field = findTitleField();
   if (!field) return {state: 'title_field_not_found', recording: false, title};
   setFieldValue(field, title);
   await sleep(250);
 
-  const submit = findByText([/^Записать звонок$/i, /^Создать запись/i]);
+  const submit = findSubmit();
   if (!submit) return {state: 'submit_not_found', recording: false, title};
   clickNode(submit);
   await sleep(900);

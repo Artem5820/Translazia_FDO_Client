@@ -33,9 +33,10 @@ class TwoDigitSpinBox(QSpinBox):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setKeyboardTracking(False)
-        self.lineEdit().setReadOnly(True)
-        self.lineEdit().setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.lineEdit().setCursor(Qt.CursorShape.ArrowCursor)
+        self.setButtonSymbols(QSpinBox.ButtonSymbols.UpDownArrows)
+        self.lineEdit().setReadOnly(False)
+        self.lineEdit().setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.lineEdit().setCursor(Qt.CursorShape.IBeamCursor)
 
     def textFromValue(self, value: int) -> str:
         return f"{value:02d}"
@@ -187,23 +188,24 @@ class NotificationWindow(QMainWindow):
         frame = QFrame()
         frame.setObjectName("stripRecordControlBar" if compact else "recordControlBar")
         root = QVBoxLayout(frame)
-        root.setContentsMargins(4 if compact else 8, 6, 4 if compact else 8, 6)
-        root.setSpacing(5 if compact else 6)
+        root.setContentsMargins(6 if compact else 8, 6, 6 if compact else 8, 6)
+        root.setSpacing(7 if compact else 6)
 
         button_row = QHBoxLayout()
         button_row.setContentsMargins(0, 0, 0, 0)
-        button_row.setSpacing(6)
+        button_row.setSpacing(8 if compact else 6)
 
         record_btn = QPushButton("Запись")
         record_btn.setObjectName("recordManualButton")
         record_btn.setToolTip("Поставить запись вручную на всех открытых вкладках")
         record_btn.clicked.connect(self.record_all_requested.emit)
-        record_btn.setFixedWidth(84 if compact else 116)
+        record_btn.setFixedWidth(82 if compact else 116)
 
         hour_spin = TwoDigitSpinBox()
         hour_spin.setObjectName("recordTimeSpin")
         hour_spin.setRange(0, 23)
-        hour_spin.setFixedWidth(94 if compact else 92)
+        hour_spin.setFixedWidth(106 if compact else 96)
+        hour_spin.setMinimumHeight(36)
         hour_spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
         hour_spin.setWrapping(True)
 
@@ -215,7 +217,8 @@ class NotificationWindow(QMainWindow):
         minute_spin = TwoDigitSpinBox()
         minute_spin.setObjectName("recordTimeSpin")
         minute_spin.setRange(0, 59)
-        minute_spin.setFixedWidth(94 if compact else 92)
+        minute_spin.setFixedWidth(106 if compact else 96)
+        minute_spin.setMinimumHeight(36)
         minute_spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
         minute_spin.setWrapping(True)
 
@@ -229,7 +232,7 @@ class NotificationWindow(QMainWindow):
         confirm_btn = QPushButton("OK")
         confirm_btn.setObjectName("recordConfirmButton")
         confirm_btn.setToolTip("Подтвердить автозапись на сегодня")
-        confirm_btn.setFixedWidth(48 if compact else 62)
+        confirm_btn.setFixedWidth(54 if compact else 62)
         confirm_btn.clicked.connect(self._confirm_auto_recording)
 
         hour_spin.valueChanged.connect(lambda value: self._set_record_time(value, minute_spin.value()))
@@ -239,7 +242,7 @@ class NotificationWindow(QMainWindow):
         time_row_frame.setObjectName("recordTimeRow")
         time_row = QHBoxLayout(time_row_frame)
         time_row.setContentsMargins(0, 0, 0, 0)
-        time_row.setSpacing(6)
+        time_row.setSpacing(8)
         time_row.addWidget(hour_spin)
         time_row.addWidget(colon)
         time_row.addWidget(minute_spin)
@@ -386,7 +389,7 @@ class NotificationWindow(QMainWindow):
         self.compact_panel.setVisible(compact)
         if compact:
             self.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.WindowMinimizeButtonHint | Qt.WindowType.WindowStaysOnTopHint)
-            self.setFixedWidth(240)
+            self.setFixedWidth(280)
         else:
             self.setWindowFlags(Qt.WindowType.Window)
             self.setMinimumWidth(0)

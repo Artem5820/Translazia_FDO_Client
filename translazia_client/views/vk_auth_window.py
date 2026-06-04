@@ -10,6 +10,9 @@ from ..resources import app_icon
 from ..services.vk_web_profile import vk_web_profile
 
 
+_MAX_TODAY_REQUESTS = 2
+
+
 class VkAuthWindow(QMainWindow):
     closed = Signal()
     auth_check_requested = Signal()
@@ -24,6 +27,8 @@ class VkAuthWindow(QMainWindow):
         self._today_clicks = 0
         self._today_click_in_flight = False
         self._today_requested = False
+        self._schedule_command_sent = False
+        self._schedule_command_in_flight = False
         self._today_retries_scheduled = False
         self.setWindowTitle("VK авторизация | V505_Control")
         self.setWindowIcon(app_icon())
@@ -63,15 +68,24 @@ class VkAuthWindow(QMainWindow):
         self._today_clicks = 0
         self._today_click_in_flight = False
         self._today_requested = False
+        self._schedule_command_sent = False
+        self._schedule_command_in_flight = False
         self._today_retries_scheduled = False
         self.open_bot()
         self.automation_log.emit("VK: запрашиваю онлайн трансляции на сегодня.")
-        for delay in (7500, 17_500, 30_000, 45_000, 65_000):
-            QTimer.singleShot(delay, self._run_schedule_automation)
+        self._schedule_command_attempts()
         self._schedule_page_reads()
 
     def stop_schedule_request(self) -> None:
         self._automation_requested = False
+        self._schedule_command_sent = True
+        self._schedule_command_in_flight = False
+        self._today_click_in_flight = False
+        self._today_requested = True
+        self._today_retries_scheduled = True
+
+    def has_requested_today_period(self) -> bool:
+        return self._today_requested
 
     def _grant_permission(self, origin: QUrl, feature: QWebEnginePage.Feature) -> None:
         self.web.page().setFeaturePermission(origin, feature, QWebEnginePage.PermissionPolicy.PermissionGrantedByUser)
@@ -95,8 +109,12 @@ class VkAuthWindow(QMainWindow):
 """
         self.web.page().runJavaScript(auth_script, self._emit_page_auth)
         self.web.page().runJavaScript("document.body ? document.body.innerText : ''", self._emit_page_text)
-        if self._automation_requested and not self._today_requested:
+        if self._automation_requested and not self._schedule_command_sent and not self._today_requested:
             self._run_schedule_automation()
+
+    def _schedule_command_attempts(self) -> None:
+        for delay in (2500, 5500, 9000, 14000, 22000):
+            QTimer.singleShot(delay, self._run_schedule_automation)
 
     def _emit_page_auth(self, authorized: object) -> None:
         is_authorized = bool(authorized)
@@ -107,8 +125,16 @@ class VkAuthWindow(QMainWindow):
             self.page_text_ready.emit(text)
 
     def _run_schedule_automation(self) -> None:
-        if not self._automation_requested or self._today_requested or self._today_clicks >= 2:
+        if not self._automation_requested:
             return
+        if self._today_requested:
+            return
+        if self._schedule_command_in_flight:
+            return
+        if self._schedule_command_sent:
+            self._click_today_button()
+            return
+        self._schedule_command_in_flight = True
         script = """
 (() => {
   const visible = (el) => {
@@ -124,10 +150,30 @@ class VkAuthWindow(QMainWindow):
     const rect = node.getBoundingClientRect();
     const x = rect.left + rect.width / 2;
     const y = rect.top + rect.height / 2;
-    for (const type of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
-      node.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y}));
+    const pointTarget = document.elementFromPoint(x, y) || node;
+    for (const type of ['pointerdown', 'mousedown', 'mouseup']) {
+      pointTarget.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y}));
     }
-    node.click();
+    const target = typeof pointTarget.click === 'function' ? pointTarget : node;
+    target.click();
+  };
+  const textNodeCandidates = (patterns, maxLen = 90) => {
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    const items = [];
+    while (walker.nextNode()) {
+      const textNode = walker.currentNode;
+      const label = norm(textNode.nodeValue);
+      if (!label || label.length > maxLen || !patterns.some((pattern) => pattern.test(label))) continue;
+      const parent = textNode.parentElement;
+      if (!parent || !visible(parent)) continue;
+      const range = document.createRange();
+      range.selectNodeContents(textNode);
+      const rect = range.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) continue;
+      const clickable = parent.closest(clickableSelector) || parent;
+      items.push({clickable, label, rect});
+    }
+    return items;
   };
   const candidateNodes = () => Array.from(document.querySelectorAll(`${clickableSelector}, div, span`))
     .filter((node) => visible(node))
@@ -140,6 +186,7 @@ class VkAuthWindow(QMainWindow):
   const clickByText = (patterns, maxLen = 90) => {
     const candidates = candidateNodes()
       .filter((item) => item.label && item.label.length <= maxLen && patterns.some((pattern) => pattern.test(item.label)))
+      .concat(textNodeCandidates(patterns, maxLen))
       .sort((left, right) => right.rect.top - left.rect.top);
     if (candidates.length) {
       fireClick(candidates[0].clickable);
@@ -162,17 +209,40 @@ class VkAuthWindow(QMainWindow):
     if (clicked) return {status: 'clicked-online', action: clicked};
   }
 
-  clicked = clickByText([/^Главное меню$/i], 50);
-  if (clicked) return {status: 'clicked-menu', action: clicked};
-
   clicked = clickByText([/^5\\s*[-–—]?\\s*Онлайн трансляции$/i], 50);
   if (clicked) return {status: 'clicked-online', action: clicked};
   clicked = clickByText([/^Сегодня$/i], 40);
   if (clicked) return {status: 'clicked-today', action: clicked};
 
-  const editable = document.querySelector('[contenteditable="true"], textarea, input[type="text"]');
+  const clickSendButton = (editable) => {
+    const editorRect = editable.getBoundingClientRect();
+    const sendCandidates = Array.from(document.querySelectorAll('button, [role="button"], [aria-label], [title], .vkuiButton, .Button, [tabindex]'))
+      .filter((node) => visible(node))
+      .map((node) => {
+        const rect = node.getBoundingClientRect();
+        const label = norm(node.getAttribute('aria-label') || node.getAttribute('title') || node.innerText || node.textContent);
+        return {node, rect, label};
+      })
+      .filter((item) => {
+        if (/Отправить|Send/i.test(item.label)) return true;
+        const nearEditor = item.rect.left >= editorRect.right - 30
+          && item.rect.top >= editorRect.top - 25
+          && item.rect.top <= editorRect.bottom + 35
+          && item.rect.width <= 80
+          && item.rect.height <= 80;
+        return nearEditor && item.node.querySelector('svg');
+      })
+      .sort((left, right) => {
+        const score = (label) => /Отправить|Send/i.test(label) ? 1 : 0;
+        return score(right.label) - score(left.label) || right.rect.left - left.rect.left;
+      });
+    if (!sendCandidates.length) return false;
+    fireClick(sendCandidates[0].node);
+    return true;
+  };
+  const editable = document.querySelector('[contenteditable="true"], [contenteditable]:not([contenteditable="false"]), [role="textbox"], textarea, input[type="text"]');
   if (editable && visible(editable)) {
-    const command = mainMenuVisible ? '5-Онлайн трансляции' : 'Главное меню';
+    const command = '5-Онлайн трансляции';
     editable.focus();
     if ('value' in editable) {
       editable.value = command;
@@ -184,7 +254,8 @@ class VkAuthWindow(QMainWindow):
     }
     editable.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true}));
     editable.dispatchEvent(new KeyboardEvent('keyup', {key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true}));
-    return {status: mainMenuVisible ? 'typed-command' : 'typed-menu', action: command};
+    clickSendButton(editable);
+    return {status: 'typed-command', action: command};
   }
   return {status: 'not-found', action: ''};
 })()
@@ -192,6 +263,7 @@ class VkAuthWindow(QMainWindow):
         self.web.page().runJavaScript(script, self._handle_schedule_automation)
 
     def _handle_schedule_automation(self, result: object) -> None:
+        self._schedule_command_in_flight = False
         if not isinstance(result, dict):
             return
         status = str(result.get("status", ""))
@@ -201,24 +273,19 @@ class VkAuthWindow(QMainWindow):
             self.automation_log.emit("VK: расписание на сегодня найдено.")
             self._schedule_page_reads()
         elif status == "clicked-online":
+            self._schedule_command_sent = True
             self.automation_log.emit(f"VK: нажата кнопка {action}.")
             self._schedule_today_retries()
         elif status == "clicked-today":
+            self._schedule_command_sent = True
             self._today_requested = True
             self._today_clicks += 1
             self.automation_log.emit("VK: нажата кнопка Сегодня.")
             self._schedule_page_reads()
-        elif status == "clicked-menu":
-            self.automation_log.emit("VK: перехожу в главное меню.")
-            for delay in (7500, 17_500, 30_000):
-                QTimer.singleShot(delay, self._run_schedule_automation)
         elif status == "typed-command":
+            self._schedule_command_sent = True
             self.automation_log.emit("VK: команда отправлена текстом.")
             self._schedule_today_retries()
-        elif status == "typed-menu":
-            self.automation_log.emit("VK: команда Главное меню отправлена текстом.")
-            for delay in (12_500, 25_000, 40_000):
-                QTimer.singleShot(delay, self._run_schedule_automation)
         elif status == "period-waiting":
             self._schedule_today_retries()
 
@@ -226,13 +293,13 @@ class VkAuthWindow(QMainWindow):
         if self._today_retries_scheduled or self._today_requested:
             return
         self._today_retries_scheduled = True
-        for delay in (4500, 13_000):
+        for delay in (4500, 9000):
             QTimer.singleShot(delay, self._click_today_button)
 
     def _click_today_button(self) -> None:
         if not self._automation_requested or self._today_requested:
             return
-        if self._today_click_in_flight or self._today_clicks >= 2:
+        if self._today_click_in_flight or self._today_clicks >= _MAX_TODAY_REQUESTS:
             return
         self._today_click_in_flight = True
         script = """
@@ -249,10 +316,30 @@ class VkAuthWindow(QMainWindow):
     const rect = node.getBoundingClientRect();
     const x = rect.left + rect.width / 2;
     const y = rect.top + rect.height / 2;
-    for (const type of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
-      node.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y}));
+    const pointTarget = document.elementFromPoint(x, y) || node;
+    for (const type of ['pointerdown', 'mousedown', 'mouseup']) {
+      pointTarget.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y}));
     }
-    node.click();
+    const target = typeof pointTarget.click === 'function' ? pointTarget : node;
+    target.click();
+  };
+  const textNodeCandidates = () => {
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    const items = [];
+    while (walker.nextNode()) {
+      const textNode = walker.currentNode;
+      const label = norm(textNode.nodeValue);
+      if (!/^Сегодня$/i.test(label)) continue;
+      const parent = textNode.parentElement;
+      if (!parent || !visible(parent)) continue;
+      const range = document.createRange();
+      range.selectNodeContents(textNode);
+      const rect = range.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) continue;
+      const clickable = parent.closest(clickableSelector) || parent;
+      items.push({label, clickable, rect});
+    }
+    return items;
   };
   const candidates = Array.from(document.querySelectorAll(`${clickableSelector}, div, span`))
     .filter((node) => visible(node))
@@ -263,6 +350,7 @@ class VkAuthWindow(QMainWindow):
       return {label, clickable, rect};
     })
     .filter((item) => /^Сегодня$/i.test(item.label) && item.rect.width > 0 && item.rect.height > 0)
+    .concat(textNodeCandidates())
     .sort((left, right) => right.rect.top - left.rect.top);
   if (candidates.length) {
     fireClick(candidates[0].clickable);

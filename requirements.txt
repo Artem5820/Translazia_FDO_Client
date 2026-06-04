@@ -7,3 +7,4 @@ PyYAML>=6.0
 matplotlib>=3.8
 tzdata>=2024.1
 imageio-ffmpeg>=0.5
+lap>=0.5.12

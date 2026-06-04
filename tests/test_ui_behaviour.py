@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QApplication
 
 from translazia_client.models import StreamRoom
 from translazia_client.views.main_window import MainWindow
+from translazia_client.views.manual_stream_dialog import ManualStreamDialog
 from translazia_client.views.notification_window import NotificationWindow
 
 
@@ -40,6 +41,31 @@ class UiBehaviourTests(unittest.TestCase):
 
         self.assertFalse(hasattr(window, "close_btn"))
         window.close()
+
+    def test_main_window_shows_no_classes_message_for_empty_schedule(self) -> None:
+        _app()
+        window = MainWindow()
+
+        window.set_streams([])
+
+        self.assertEqual(window.stream_table.item(0, 0).text(), "Занятий нет")
+        self.assertEqual(window.selected_count_label.text(), "Выбрано: 0 из 0")
+        window.close()
+
+    def test_manual_stream_dialog_returns_selected_streams_with_details(self) -> None:
+        _app()
+        dialog = ManualStreamDialog([StreamRoom(room="В-200", url="https://vk.com/call/join/a")])
+        dialog.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+        dialog.table.item(0, 2).setText("18:00-21:05")
+        dialog.table.item(0, 3).setText("Тестовое занятие")
+
+        selected = dialog.selected_streams()
+
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0].room, "В-200")
+        self.assertEqual(selected[0].time, "18:00-21:05")
+        self.assertEqual(selected[0].subject, "Тестовое занятие")
+        dialog.close()
 
     def test_notification_export_writes_events(self) -> None:
         _app()

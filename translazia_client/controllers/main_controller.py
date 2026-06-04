@@ -20,7 +20,9 @@ from ..services.schedule_service import load_streams
 from ..services.time_service import now_moscow, parse_hhmm
 from ..services.vk_auth_service import VkAuthChecker
 from ..services.vk_web_schedule import parse_vk_web_schedule
+from ..streams import load_streams_from_file
 from ..views.main_window import MainWindow
+from ..views.manual_stream_dialog import ManualStreamDialog
 from ..views.notification_window import NotificationWindow
 from ..views.settings_dialog import SettingsDialog
 from ..views.stream_window import StreamWindow
@@ -60,6 +62,8 @@ class MainController(QObject):
         self._recording_generation = 0
         self._recording_attempts: dict[str, int] = {}
         self._recording_confirmed_rooms: set[str] = set()
+        self._recording_pending_rooms: set[str] = set()
+        self._recording_manual_wait_rooms: set[str] = set()
         self._recording_check_results: dict[str, dict[str, object]] = {}
         self._stream_launch_retry_rooms: set[str] = set()
         self._lesson_not_started_rooms: set[str] = set()
@@ -86,6 +90,7 @@ class MainController(QObject):
     def _connect(self) -> None:
         self.main_window.refresh_requested.connect(self.refresh_schedule)
         self.main_window.launch_requested.connect(self.launch_selected)
+        self.main_window.manual_streams_requested.connect(self.open_manual_stream_selection)
         self.main_window.settings_requested.connect(self.open_settings)
         self.main_window.notifications_requested.connect(self.show_notifications)
         self.main_window.vk_login_requested.connect(self.open_vk_login)
@@ -139,11 +144,28 @@ class MainController(QObject):
     @Slot(str)
     def _on_schedule_failed(self, error: str) -> None:
         self.main_window.set_loading(False)
+        self.main_window.set_streams([])
         self.main_window.show_status("Не удалось загрузить расписание")
         self.main_window.append_log(f"Ошибка загрузки расписания: {error}")
         self.notification_window.add_event("Ошибка", "", "Не удалось загрузить расписание", error)
         self.show_notifications()
         self.main_window.show_warning("Расписание не загружено", error)
+
+    @Slot()
+    def open_manual_stream_selection(self) -> None:
+        try:
+            streams = load_streams_from_file(self.settings.source.local_file)
+        except Exception as exc:
+            self.main_window.show_warning("Ручной режим недоступен", f"Не удалось загрузить список аудиторий: {exc}")
+            return
+        dialog = ManualStreamDialog(streams, self.main_window)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        selected = dialog.selected_streams()
+        self.main_window.set_streams(selected, {f"{stream.room}|{stream.url}" for stream in selected})
+        self.main_window.update_cards(self.settings)
+        self.main_window.show_status(f"Ручной режим: выбрано {len(selected)} аудиторий")
+        self.main_window.append_log(f"Ручной режим: выбрано аудиторий: {len(selected)}.")
 
     @Slot()
     def launch_selected(self) -> None:
@@ -491,9 +513,18 @@ class MainController(QObject):
         generation = self._recording_generation
         self._recording_attempts = {room: 0 for room in self.stream_windows}
         self._recording_confirmed_rooms.clear()
+        self._recording_pending_rooms.clear()
+        self._recording_manual_wait_rooms.clear()
         self._recording_check_results.clear()
         self.notification_window.add_event("Информация", "", f"Постановка записи: {len(self.stream_windows)} вкладок", reason)
+        self.notification_window.add_event(
+            "Информация",
+            "",
+            "Полуавтомат записи",
+            "В каждом окне откройте: шестерёнка → Записать звонок. Название заполнится само.",
+        )
         self.main_window.append_log(f"Запускаю постановку записи на {len(self.stream_windows)} вкладках ({reason}).")
+        self.main_window.append_log("Откройте в каждом окне: шестерёнка → Записать звонок. Название заполнится автоматически.")
         for room in list(self.stream_windows.keys()):
             self._request_stream_recording(room, generation)
         QTimer.singleShot(_RECORDING_VERIFY_DELAY_MS, lambda generation=generation: self._verify_stream_recordings(generation))
@@ -505,6 +536,8 @@ class MainController(QObject):
         if window is None:
             return
         self._recording_attempts[room] = self._recording_attempts.get(room, 0) + 1
+        self._recording_pending_rooms.add(room)
+        self._recording_manual_wait_rooms.discard(room)
         title = _recording_title(window.stream.room)
         window.ensure_call_recording(
             title,
@@ -517,6 +550,7 @@ class MainController(QObject):
         state = str(result.get("state", "unknown"))
         title = str(result.get("title", _recording_title(room)))
         attempt = self._recording_attempts.get(room, 1)
+        self._recording_pending_rooms.discard(room)
         if result.get("recording"):
             self._recording_confirmed_rooms.add(room)
             self.notification_window.add_event("Проверка", room, f"{room} - запись уже идёт")
@@ -526,6 +560,8 @@ class MainController(QObject):
             self.notification_window.add_event("Информация", room, f"{room} - команда записи отправлена")
             self.main_window.append_log(f"{room}: команда записи отправлена. Попытка {attempt}.")
             return
+        if state == "record_dialog_timeout":
+            self._recording_manual_wait_rooms.add(room)
         self.notification_window.add_event(
             "Предупреждение",
             room,
@@ -566,6 +602,10 @@ class MainController(QObject):
         for room in rooms:
             if room not in self.stream_windows:
                 continue
+            if room in self._recording_pending_rooms:
+                continue
+            if room in self._recording_manual_wait_rooms:
+                continue
             result = self._recording_check_results.get(room, {"recording": False, "state": "no_callback"})
             if result.get("recording"):
                 if room not in self._recording_confirmed_rooms:
@@ -587,9 +627,11 @@ class MainController(QObject):
             self.notification_window.add_event("Ошибка", room, f"{room} - запись не включилась", "Достигнут лимит повторных попыток.")
             self.main_window.append_log(f"{room}: запись не включилась после {_MAX_RECORDING_ATTEMPTS} попыток.")
 
-        if retry_rooms:
+        if self._recording_pending_rooms:
+            QTimer.singleShot(5000, lambda generation=generation: self._verify_stream_recordings(generation))
+        elif retry_rooms:
             QTimer.singleShot(_RECORDING_VERIFY_DELAY_MS, lambda generation=generation: self._verify_stream_recordings(generation))
-        elif not failed_rooms:
+        elif not failed_rooms and not self._recording_manual_wait_rooms:
             self.notification_window.add_event("Информация", "", "Запись включена на всех вкладках")
             self.main_window.append_log("Запись подтверждена на всех открытых вкладках.")
 
@@ -681,7 +723,7 @@ class MainController(QObject):
         if request_id != self._vk_schedule_request_id:
             return
         if self._vk_schedule_request_active:
-            self.main_window.append_log("VK: расписание не получено за время ожидания, можно повторить обновление.")
+            self._show_no_classes("VK: расписание не получено за время ожидания.")
         if self.vk_auth_window is not None:
             self.vk_auth_window.stop_schedule_request()
         self._vk_schedule_request_active = False
@@ -718,6 +760,12 @@ class MainController(QObject):
     def _on_vk_page_text_ready(self, text: str) -> None:
         if not self._vk_schedule_request_active:
             return
+        if _vk_text_says_no_classes(text):
+            self._vk_schedule_request_active = False
+            if self.vk_auth_window is not None:
+                self.vk_auth_window.stop_schedule_request()
+            self._show_no_classes("VK: бот ответил, что онлайн занятий нет.")
+            return
         streams = parse_vk_web_schedule(text, self.settings.source, now_moscow().date())
         if not streams:
             return
@@ -737,6 +785,14 @@ class MainController(QObject):
         self.main_window.show_status(f"VK расписание получено: {len(streams)} аудиторий")
         self.main_window.append_log(f"VK расписание получено автоматически: {len(streams)} аудиторий.")
         self.notification_window.add_event("Информация", "", "VK расписание получено", f"Аудиторий: {len(streams)}")
+
+    def _show_no_classes(self, log_message: str) -> None:
+        self.main_window.set_loading(False)
+        self.main_window.set_streams([])
+        self.main_window.update_cards(self.settings)
+        self.main_window.show_status("Занятий нет")
+        self.main_window.append_log(log_message)
+        self.notification_window.add_event("Информация", "", "Занятий нет")
 
     def _load_vk_auth_hint(self) -> bool:
         return (DATA_DIR / "vk_auth_ok.json").exists()
@@ -942,7 +998,7 @@ def _screens() -> list[ScreenRect]:
     ]
 
 
-def _screens_with_notification_strip(strip_width: int = 240) -> tuple[list[ScreenRect], ScreenRect]:
+def _screens_with_notification_strip(strip_width: int = 280) -> tuple[list[ScreenRect], ScreenRect]:
     screens = _screens()
     if not screens:
         screens = [ScreenRect(0, 0, 1280, 720)]
@@ -987,10 +1043,25 @@ def _recording_state_message(state: str) -> str:
         "submit_not_found": "Окно записи открылось, но кнопка подтверждения не найдена.",
         "record_action_not_found": "Меню настроек открылось, но пункт записи звонка не найден.",
         "record_dialog_not_opened": "Пункт записи найден, но окно создания записи не открылось.",
+        "not_in_call": "Окно ещё не находится в звонке. Сначала нужно присоединиться к трансляции.",
+        "window_not_visible": "Окно трансляции свёрнуто или скрыто. Разверните окно перед постановкой записи.",
+        "no_result": "Команда записи не вернула результат. Повторите после полной загрузки окна звонка.",
+        "waiting_record_dialog": "Ожидаю окно создания записи звонка.",
+        "record_dialog_timeout": "Окно создания записи не открылось. Нажмите шестерёнку и пункт «Записать звонок», затем запустите запись снова.",
         "closed": "Вкладка закрыта.",
         "unknown": "Не удалось получить результат команды.",
     }
     return messages.get(state, f"Состояние: {state}")
+
+
+def _vk_text_says_no_classes(text: str) -> bool:
+    normalized = " ".join((text or "").lower().split())
+    markers = (
+        "онлайн занятий в выбранном периоде нет",
+        "занятий в выбранном периоде нет",
+        "онлайн занятий нет",
+    )
+    return any(marker in normalized for marker in markers)
 
 
 def _summary_waits_for_video(summary: AnalysisSummary) -> bool:
